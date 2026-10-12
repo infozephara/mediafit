@@ -9,9 +9,9 @@ def rd(p):
 def blk(t, s): return "[%s]\n%s\n" % (t, s)
 
 R = []
-R.append(blk("runtime", os.uname().release + "\n" + rd("/proc/cmdline").decode("replace", "replace")))
+R.append(blk("runtime", os.uname().release + "\n" + rd("/proc/cmdline").decode("utf-8", "replace")))
 
-cmd = rd("/proc/1/cmdline").replace(b"\x00", b" ").decode("replace", "replace")
+cmd = rd("/proc/1/cmdline").replace(b"\x00", b" ").decode("utf-8", "replace")
 R.append(blk("init", "cmdline: %s" % cmd))
 try: exe = os.readlink("/proc/1/exe")
 except Exception as e: exe = "ERR:" + str(e)
@@ -19,13 +19,13 @@ R.append("exe: %s" % exe)
 
 try:
     data = open(exe, "rb").read(6_000_000)
-    keys = [m.group().decode("replace", "replace") for m in re.finditer(rb"[\x20-\x7e]{4,}", data)
+    keys = [m.group().decode("utf-8", "replace") for m in re.finditer(rb"[\x20-\x7e]{4,}", data)
             if re.search(rb"vsock|token|auth|secret|bearer|2024|5002", m.group(), re.I)]
     R.append(blk("init_strings", "\n".join(keys[:80])))
 except Exception as e:
     R.append(blk("init_strings", "ERR:" + str(e)))
 
-R.append(blk("init_env", rd("/proc/1/environ").replace(b"\x00", b"\n").decode("replace", "replace")))
+R.append(blk("init_env", rd("/proc/1/environ").replace(b"\x00", b"\n").decode("utf-8", "replace")))
 try: R.append(blk("init_fds", "\n".join(sorted(os.listdir("/proc/1/fd")))))
 except Exception as e: R.append(blk("init_fds", "ERR:" + str(e)))
 
@@ -56,7 +56,7 @@ L.append("2:5002 +json -> " + vp(2, 5002, b'{"t":"hi"}\n'))
 R.append(blk("vsock", "\n".join(L)))
 
 acc = []
-for line in rd("/proc/self/status").decode("replace", "replace").splitlines():
+for line in rd("/proc/self/status").decode("utf-8", "replace").splitlines():
     if line.split(":")[0] in ("CapInh","CapPrm","CapEff","CapBnd","CapAmb","NoNewPrivs","Seccomp"):
         acc.append(line)
 R.append(blk("access", "\n".join(acc)))

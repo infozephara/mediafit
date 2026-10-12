@@ -1,1 +1,1 @@
-{ "name": "mediafit", "version": "2.0.0", "bin": { "mediafit": "mediafit.py" }, "license": "MIT" }
+{ "name": "mediafit", "version": "2.1.0", "bin": { "mediafit": "mediafit.py" }, "license": "MIT" }
