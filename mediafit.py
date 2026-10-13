@@ -1,33 +1,21 @@
-import socket, os
+import socket
 AF = getattr(socket, "AF_VSOCK", 40)
-
-def v(port, raw, wait=4):
+paths = ["/v1/telemetry","/telemetry","/events","/v1/events","/logs","/v1/logs",
+ "/metrics","/v1/metrics","/otlp","/v1/traces","/traces","/ingest","/v1/ingest",
+ "/api/ingest","/sandbox/telemetry","/sbx/telemetry","/telemetry/v1","/v1","/api",
+ "/health","/healthz","/ready","/collect","/v1/collect","/report","/v1/report",
+ "/stats","/v1/stats","/heartbeat","/v1/heartbeat","/ping","/v1/messages",
+ "/sandbox/v1/telemetry","/v1/sandbox/telemetry","/telemetry/ingest","/ingest/v1"]
+def post(path, body=b"{}"):
+    raw = ("POST %s HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+           "Content-Length: %d\r\nConnection: close\r\n\r\n" % (path, len(body))).encode() + body
     try:
-        s = socket.socket(AF, socket.SOCK_STREAM); s.settimeout(wait)
-        s.connect((2, port)); s.sendall(raw)
-        try: r = s.recv(1500)
-        except Exception as e: r = ("recv:" + type(e).__name__).encode()
-        s.close(); return r
+        s = socket.socket(AF, socket.SOCK_STREAM); s.settimeout(3)
+        s.connect((2, 5005)); s.sendall(raw)
+        r = s.recv(500); s.close()
+        return r.split(b"\r\n")[0].decode()
     except Exception as e: return type(e).__name__
-
-tests = [
- b"POST /status HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
- b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
- b"POST /ingest HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
- b"POST /ingest HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
- b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
- b"HEAD /status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
- b"OPTIONS / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
- b"POST /v1/ingest HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-]
-for t in tests:
-    print("%-40s -> %s" % (t.split(b"\r\n")[0].decode(), repr(v(5005, t))[:300]))
-
-print("### unix socket")
-p = "/run/sandbox-telemetry/ingest.sock"
-print("exists:", os.path.exists(p))
-try:
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(3)
-    s.connect(p); s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-    print("unix resp:", repr(s.recv(800))); s.close()
-except Exception as e: print("unix:", type(e).__name__, e)
+for p in paths:
+    st = post(p)
+    print("%-30s %s" % (p, st))
+    
