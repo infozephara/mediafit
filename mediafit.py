@@ -1,31 +1,28 @@
-import os, socket
+import os
+for pid in ("56", "57"):
+    print("========== PID %s ==========" % pid)
+    for f in ("comm", "cmdline"):
+        try: print(f + ":", open("/proc/%s/%s" % (pid, f)).read().replace("\x00", " ").strip())
+        except Exception as e: print(f, "ERR", e)
+    try:
+        print("--- environ ---")
+        print(open("/proc/%s/environ" % pid).read().replace(b"\x00", b"\n").decode("utf-8", "replace"))
+    except Exception as e: print("environ ERR", e)
+    try:
+        print("--- fds ---")
+        for x in sorted(os.listdir("/proc/%s/fd" % pid), key=int):
+            try: print("  %s -> %s" % (x, os.readlink("/proc/%s/fd/%s" % (pid, x))))
+            except Exception as e: print("  %s -> ERR %s" % (x, e))
+    except Exception as e: print("fd ERR", e)
+    print()
 
-print("### processes (all /proc/*/comm)")
-for p in sorted(os.listdir("/proc")):
-    if p.isdigit():
-        try:
-            c = open("/proc/%s/comm" % p).read().strip()
-            cmd = open("/proc/%s/cmdline" % p).read().replace("\x00", " ").strip()
-            print("%5s %-18s %s" % (p, c, cmd[:110]))
-        except Exception: pass
-
-print("### vsock precise (cid:port -> errno)")
+# scan host vsock listeners
+import socket
 AF = getattr(socket, "AF_VSOCK", 40)
-for cid in (0, 1, 2, 3, 4, 0xFFFFFFFF):
-    for port in (2024, 2025, 5002, 1024):
-        try:
-            s = socket.socket(AF, socket.SOCK_STREAM); s.settimeout(2)
-            s.connect((cid, port)); print("  OK  %s:%d" % (cid, port)); s.close()
-        except Exception as e:
-            print("  ERR %s:%d %s errno=%s" % (cid, port, type(e).__name__, getattr(e, "errno", None)))
-
-print("### TCP 2025: no-send then read")
-try:
-    s = socket.create_connection(("127.0.0.1", 2025), 3); s.settimeout(4)
-    try: print("  greeting:", repr(s.recv(500)))
-    except Exception as e: print("  greeting:", type(e).__name__)
-    s.close()
-except Exception as e: print("  ", type(e).__name__)
-
-print("### /proc/net/tcp full")
-print(open("/proc/net/tcp").read())
+found = []
+for port in range(1, 10001):
+    try:
+        s = socket.socket(AF, socket.SOCK_STREAM); s.settimeout(0.2)
+        s.connect((2, port)); s.close(); found.append(port)
+    except Exception: pass
+print("### host vsock listeners 1-10000:", found)
