@@ -1,21 +1,31 @@
 import socket
 AF = getattr(socket, "AF_VSOCK", 40)
-paths = ["/v1/telemetry","/telemetry","/events","/v1/events","/logs","/v1/logs",
- "/metrics","/v1/metrics","/otlp","/v1/traces","/traces","/ingest","/v1/ingest",
- "/api/ingest","/sandbox/telemetry","/sbx/telemetry","/telemetry/v1","/v1","/api",
- "/health","/healthz","/ready","/collect","/v1/collect","/report","/v1/report",
- "/stats","/v1/stats","/heartbeat","/v1/heartbeat","/ping","/v1/messages",
- "/sandbox/v1/telemetry","/v1/sandbox/telemetry","/telemetry/ingest","/ingest/v1"]
-def post(path, body=b"{}"):
-    raw = ("POST %s HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
-           "Content-Length: %d\r\nConnection: close\r\n\r\n" % (path, len(body))).encode() + body
+
+def post(path, ctype, body=b"", extra=""):
+    raw = ("POST %s HTTP/1.1\r\nHost: x\r\nContent-Type: %s\r\nContent-Length: %d\r\n%sConnection: close\r\n\r\n"
+           % (path, ctype, len(body), extra)).encode() + body
     try:
-        s = socket.socket(AF, socket.SOCK_STREAM); s.settimeout(3)
+        s = socket.socket(AF, socket.SOCK_STREAM); s.settimeout(4)
         s.connect((2, 5005)); s.sendall(raw)
-        r = s.recv(500); s.close()
-        return r.split(b"\r\n")[0].decode()
+        r = s.recv(800); s.close()
+        return r.split(b"\r\n")[0].decode() + " | body=" + repr(r.split(b"\r\n\r\n", 1)[-1][:120])
     except Exception as e: return type(e).__name__
-for p in paths:
-    st = post(p)
-    print("%-30s %s" % (p, st))
-    
+
+print("### content-type probe on /v1/metrics")
+for ct in ("application/x-protobuf", "application/protobuf", "application/octet-stream",
+           "application/json", "text/plain", "application/grpc"):
+    print("%-30s -> %s" % (ct, post("/v1/metrics", ct)))
+
+print("### empty protobuf body")
+print("x-protobuf empty:", post("/v1/metrics", "application/x-protobuf"))
+
+print("### other OTLP paths")
+for p in ("/v1/logs", "/v1/traces"):
+    print("%-14s -> %s" % (p, post(p, "application/x-protobuf")))
+
+print("### GET on /v1/metrics")
+try:
+    s = socket.socket(AF, socket.SOCK_STREAM); s.settimeout(4)
+    s.connect((2, 5005)); s.sendall(b"GET /v1/metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    print(s.recv(400)); s.close()
+except Exception as e: print(type(e).__name__)
