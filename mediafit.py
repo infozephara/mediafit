@@ -1,28 +1,39 @@
-import os
-for pid in ("56", "57"):
-    print("========== PID %s ==========" % pid)
-    for f in ("comm", "cmdline"):
-        try: print(f + ":", open("/proc/%s/%s" % (pid, f)).read().replace("\x00", " ").strip())
-        except Exception as e: print(f, "ERR", e)
-    try:
-        print("--- environ ---")
-        print(open("/proc/%s/environ" % pid).read().replace(b"\x00", b"\n").decode("utf-8", "replace"))
-    except Exception as e: print("environ ERR", e)
-    try:
-        print("--- fds ---")
-        for x in sorted(os.listdir("/proc/%s/fd" % pid), key=int):
-            try: print("  %s -> %s" % (x, os.readlink("/proc/%s/fd/%s" % (pid, x))))
-            except Exception as e: print("  %s -> ERR %s" % (x, e))
-    except Exception as e: print("fd ERR", e)
-    print()
+import os, socket
 
-# scan host vsock listeners
-import socket
-AF = getattr(socket, "AF_VSOCK", 40)
-found = []
-for port in range(1, 10001):
+def env(pid):
     try:
-        s = socket.socket(AF, socket.SOCK_STREAM); s.settimeout(0.2)
-        s.connect((2, port)); s.close(); found.append(port)
-    except Exception: pass
-print("### host vsock listeners 1-10000:", found)
+        b = open("/proc/%s/environ" % pid, "rb").read()
+        return b.replace(b"\x00", b"\n").decode("utf-8", "replace")
+    except Exception as e: return "ERR:" + str(e)
+
+for pid in ("56", "57"):
+    print("========== PID %s environ ==========" % pid)
+    print(env(pid) or "(empty)")
+
+print("### /proc/net/vsock")
+try: print(open("/proc/net/vsock").read())
+except Exception as e: print("ERR", e)
+
+print("### /proc/net/tcp (all)")
+print(open("/proc/net/tcp").read())
+
+print("### /proc/net/unix")
+try: print(open("/proc/net/unix").read()[:1500])
+except Exception as e: print("ERR", e)
+
+AF = getattr(socket, "AF_VSOCK", 40)
+def v(port, payload, wait=4):
+    try:
+        s = socket.socket(AF, socket.SOCK_STREAM); s.settimeout(wait)
+        s.connect((2, port))
+        if payload: s.sendall(payload)
+        try: r = repr(s.recv(1000))
+        except Exception as e: r = "recv:" + type(e).__name__
+        s.close(); return r
+    except Exception as e: return type(e).__name__
+
+print("### vsock 2:5005")
+print("no-send:", v(5005, None))
+print("http   :", v(5005, b"GET /status HTTP/1.0\r\n\r\n"))
+print("nl     :", v(5005, b"\n"))
+print("json   :", v(5005, b'{"t":"hi"}\n'))
