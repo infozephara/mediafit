@@ -1,4 +1,4 @@
-import socket
+import socket, struct
 
 def varint(n):
     o = b""
@@ -8,18 +8,17 @@ def varint(n):
         else: return o + bytes([b])
 def ld(f, d): return varint((f << 3) | 2) + varint(len(d)) + d
 def vi(f, n): return varint((f << 3) | 0) + varint(n)
-def fx64(f, v): return varint((f << 3) | 1) + v.to_bytes(8, "little")
+def fx64(f, v): return varint((f << 3) | 1) + struct.pack("<d", float(v))
 
-# --- نبني ExportMetricsServiceRequest صالحاً بأيدينا ---
-av   = ld(1, b"probe")                          # AnyValue.string_value
-kv   = ld(1, b"service.name") + ld(2, av)       # KeyValue
-res  = ld(1, kv)                                 # Resource.attributes
-ndp  = vi(3, 1_000_000_000) + fx64(4, 1.0)      # NumberDataPoint{time, as_double}
-gau  = ld(1, ndp)                                # Gauge.data_points
-met  = ld(1, b"probe.metric") + ld(2, b"probe") + ld(3, b"1") + ld(5, gau)  # Metric
-sm   = ld(2, met)                                # ScopeMetrics.metrics
-rm   = ld(1, res) + ld(2, sm)                    # ResourceMetrics
-req  = ld(1, rm)                                 # ExportMetricsServiceRequest
+av   = ld(1, b"probe")
+kv   = ld(1, b"service.name") + ld(2, av)
+res  = ld(1, kv)
+ndp  = vi(3, 1_000_000_000) + fx64(4, 1.0)
+gau  = ld(1, ndp)
+met  = ld(1, b"probe.metric") + ld(2, b"probe") + ld(3, b"1") + ld(5, gau)
+sm   = ld(2, met)
+rm   = ld(1, res) + ld(2, sm)
+req  = ld(1, rm)
 
 AF = getattr(socket, "AF_VSOCK", 40)
 def post(path, body, ctype="application/x-protobuf"):
@@ -34,4 +33,3 @@ def post(path, body, ctype="application/x-protobuf"):
 
 print("payload bytes:", len(req))
 print("POST /v1/metrics ->", post("/v1/metrics", req))
-print("POST /v1/metrics (repeat) ->", post("/v1/metrics", req))
