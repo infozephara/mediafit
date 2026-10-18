@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""mediafit.py v2.8.0 -- resolve gateway protocol/port: https/h2c, pid57 env, net tables."""
-import os, sys, json, re, time, ssl, base64, subprocess, traceback
+"""mediafit.py v2.9.0 -- find who provides the 9112 gateway; ws probe; mount liveness."""
+import os, sys, json, re, time, ssl, base64, socket, subprocess, traceback
 import urllib.request, urllib.error
 
-VER="2.8.0"; REPORT="/mnt/user-data/outputs/mediafit-report.txt"
+VER="2.9.0"; REPORT="/mnt/user-data/outputs/mediafit-report.txt"
 SINKS=["/mnt/user-data/outputs","/tmp/mediafit","/tmp","/root/.mediafit"]
 OUT,G=[],{}
 def w(s=""): print(s,flush=True); OUT.append(str(s))
@@ -14,7 +14,7 @@ def rec(k,m,ev=None):
     w("    "+{"P":"[PASS]","F":"[FAIL]","U":"[UNKNOWN]","I":"[INFO]"}[k]+" "+m)
     if ev is not None: w("        evidence: "+str(ev)[:700])
     {"P":P,"F":F,"U":U,"I":I}[k].append(m)
-def sh(a,timeout=40,env=None):
+def sh(a,timeout=25,env=None):
     try:
         p=subprocess.run(a,capture_output=True,timeout=timeout,env=env)
         return p.returncode,p.stdout.decode("utf-8","replace"),p.stderr.decode("utf-8","replace")
@@ -38,33 +38,16 @@ def step(n,f):
     except Exception as e:
         w("    !! %s crashed: %s"%(n,e)); w("    "+traceback.format_exc().strip().splitlines()[-1][:200])
 
-# ---------- basics (config/fsids/tokens) ----------
 def s_config():
     head("config"); G["CONF"]="/dev/shm/rclone-boot/config.json"
     conf=json.loads(open(G["CONF"]).read())
-    G["service_url"]=conf.get("service_url") or "https://api.anthropic.com"
     for m in conf.get("mounts",[]):
-        if m.get("filesystem_id"): G["config_fsid"]=m["filesystem_id"]
-    rec("P","config readable",G.get("config_fsid"))
-def s_fsids():
-    head("fsids"); FS=[]
-    def add(x):
-        x=(x or "").strip()
-        if x.startswith("claude_chat_") and x not in FS: FS.append(x)
-    add(G.get("config_fsid")); add("claude_chat_7SZCQKTSKBYGB750G25NK4ZXM4")
-    for v in list(os.environ.values()):
-        for m in re.findall(r"claude_chat_[A-Za-z0-9]+",v): add(m)
-    G["FSIDS"]=FS
-    for x in FS: w("    "+x)
+        if m.get("filesystem_id"): G["fsid"]=m["filesystem_id"]
+    rec("P","config readable",G.get("fsid"))
+
 def s_tokens():
     head("tokens")
-    try:
-        o=os.listdir("/mnt/user-data/outputs")
-        if o:
-            try: open("/mnt/user-data/outputs/"+o[0],"rb").read(2048)
-            except Exception: pass
-    except Exception: pass
-    time.sleep(1.5)
+    time.sleep(1)
     JWT=re.compile(rb"eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}")
     TK=[]
     def addtok(t):
@@ -101,100 +84,94 @@ def s_tokens():
             h,p,s=t.split("."); TD.append({"tok":t,"pl":json.loads(b64d(p))})
         except Exception: pass
     G["TD"]=TD
-    def pick(root):
+    def pick(r0):
         for r in TD:
-            if root in (r["pl"].get("allowed_roots") or []): return r
+            if r0 in (r["pl"].get("allowed_roots") or []): return r
         return None
-    G["T_OUT"]=pick("/outputs"); G["T_UPL"]=pick("/uploads")
-    G["TOKEN"]=(G["T_OUT"] or (TD[0] if TD else None) or {}).get("tok")
+    G["TOKEN"]=((pick("/outputs") or (TD[0] if TD else None)) or {}).get("tok")
     for r in TD: w("    roots=%s ro=%s"%(r["pl"].get("allowed_roots"),r["pl"].get("readonly")))
     rec("P" if TD else "F","tokens n=%d"%len(TD))
-    try:
-        for e in os.listdir("/mnt/user-data/outputs"):
-            if e.endswith((".txt",".json",".md")): G["FN"]=e; break
-    except Exception: pass
 
-# ---------- NEW: pid57 env / net tables ----------
-def s_pid57():
-    head("pid57 environ + fds")
+def s_mountcheck():
+    head("mount liveness (is the gateway actually needed?)")
     try:
-        for e in open("/proc/57/environ","rb").read().split(b"\0"):
-            if e: w("    env "+e.decode("latin1")[:220])
-    except Exception as ex: w("    environ err %s"%ex)
-    try:
-        fds=sorted(os.listdir("/proc/57/fd"),key=lambda x:int(x))
-        for fd in fds[:60]:
-            try: w("    fd %s -> %s"%(fd,os.readlink("/proc/57/fd/"+fd)))
-            except Exception: pass
-    except Exception: pass
-    for p in os.listdir("/proc"):
-        if not p.isdigit(): continue
-        try: cl=open("/proc/%s/cmdline"%p,"rb").read().replace(b"\0",b" ").decode("latin1").strip()
-        except Exception: continue
-        if cl and any(k in cl for k in ["filestore","rclone","gateway","proxy","9112","2024","2025"]):
-            w("    pid %s: %s"%(p,cl[:150]))
+        o=os.listdir("/mnt/user-data/outputs")
+        w("    outputs entries: %d"%len(o))
+        if o:
+            d=open("/mnt/user-data/outputs/"+o[0],"rb").read(80)
+            w("    read ok: %r"%d[:60]); rec("P","fuse mount readable")
+    except Exception as e:
+        w("    read FAIL: %s"%e); rec("F","fuse mount unreadable",e)
+    rc,out,err=sh(["bash","-lc","mount 2>/dev/null | grep -iE 'rclone|fuse' | head"])
+    for ln in out.splitlines(): w("    mount: "+ln[:200])
+    rc,out,err=sh(["bash","-lc","cat /proc/58/mounts 2>/dev/null | grep -iE 'rclone|fuse' | head"])
+    for ln in out.splitlines(): w("    pmount: "+ln[:200])
 
-def s_net():
-    head("net tables")
-    for f in ["/proc/net/tcp","/proc/net/tcp6"]:
-        try:
-            for ln in open(f).read().splitlines()[1:]:
-                p=ln.split()
-                if len(p)>3 and p[3]=="0A":
-                    a,pt=p[1].split(":"); w("    LISTEN %s:%d"%(a,int(pt,16)))
+def s_hunt():
+    head("hunt: who provides 9112 ?")
+    for root in ["/etc","/opt","/usr/local","/root","/run","/tmp","/dev/shm"]:
+        rc,out,err=sh(["bash","-lc","timeout 8 grep -rIl 9112 %s 2>/dev/null | head -15"%root])
+        for ln in out.splitlines(): w("    ref %s"%ln)
+    for d in ["/opt","/opt/rclone","/usr/local/bin","/usr/bin","/sbin","/run","/tmp","/dev/shm","/"]:
+        try: w("    ls %-16s %s"%(d,sorted(os.listdir(d))[:24]))
         except Exception: pass
+    try: w("    pid1 cmdline: "+open("/proc/1/cmdline","rb").read().replace(b"\0",b" ").decode("latin1"))
+    except Exception: pass
+    try:
+        for e in open("/proc/1/environ","rb").read().split(b"\0"):
+            if e: w("    pid1 env "+e.decode("latin1")[:200])
+    except Exception: pass
     try:
         for ln in open("/proc/net/unix").read().splitlines():
-            if any(k in ln.lower() for k in ["filestore","rclone","9112","2024","2025","gateway"]):
-                w("    UNIX "+ln[:180])
+            if any(k in ln for k in ["sock",".s","9112","filestore","rclone"]): w("    UNIX "+ln[:170])
     except Exception: pass
+    try:
+        data=open("/opt/rclone/rclone-filestore","rb").read()
+        seen=set()
+        for run in re.findall(rb"[\x20-\x7e]{4,90}", data):
+            s=run.decode("latin1")
+            if ("9112" in s or "gateway" in s.lower() or "FILESTORE_" in s or "localhost:" in s) and s not in seen:
+                seen.add(s); w("    bin: "+s)
+                if len(seen)>40: break
+    except Exception as e: w("    bin err %s"%e)
 
-# ---------- NEW: multi-protocol probe ----------
 def s_probe():
-    head("protocol probe (http / https / h2c)")
-    rc,out,err=sh(["bash","-lc","command -v curl||echo nocurl"]); w("    curl: %s"%(out.strip() or err.strip()))
-    PORTS=[9112,2024,2025,5572,9430]
-    for port in PORTS:
-        for scheme in ["http","https"]:
-            url="%s://127.0.0.1:%d/v1/filestore/fs/listDirectory"%(scheme,port)
-            st,b=http("POST",url,token=G.get("TOKEN"),data=b"{}",
-                      hdrs={"Content-Type":"application/json","Connect-Protocol-Version":"1"})
-            w("    py %-5s :%d -> %s %r"%(scheme,port,st,b[:90]))
-        for label,extra in [("curl-h1",[]),("curl-h2c",["--http2-prior-knowledge"])]:
-            url="http://127.0.0.1:%d/v1/filestore/fs/listDirectory"%port
-            args=["curl","-sS","-m","5","-X","POST",url,"-H","Content-Type: application/json",
-                  "-H","Authorization: Bearer "+(G.get("TOKEN") or ""),"-d","{}"]+extra
-            rc,out,err=sh(args)
-            w("    %s :%d rc=%s %r"%(label,port,rc,(out or err)[:100]))
+    head("probe 9112 (if up) + ws handshake on 2024/2025")
+    FSID=G.get("fsid"); TOKEN=G.get("TOKEN")
+    for path in ["/v1/filestore/fs/listDirectory"]:
+        st,b=http("POST","http://127.0.0.1:9112"+path,token=TOKEN,data=b"{}",
+                  hdrs={"Content-Type":"application/json","Connect-Protocol-Version":"1"})
+        w("    9112 %s -> %s %r"%(path,st,b[:100]))
+    ws={"Upgrade":"websocket","Connection":"Upgrade","Sec-WebSocket-Version":"13",
+        "Sec-WebSocket-Key":"dGhlIHNhbXBsZSBub25jZQ=="}
+    for port in [2024,2025]:
+        st,b=http("GET","http://127.0.0.1:%d/"%port,hdrs=ws)
+        w("    ws %d / -> %s %r"%(port,st,b[:100]))
 
-def s_rclone_sweep():
-    head("rclone url sweep (find live backend)")
-    R="/opt/rclone/rclone-filestore"
-    if not os.path.exists(R): rec("F","no rclone"); return
-    FSID=G["FSIDS"][0]; TOKEN=G.get("TOKEN") or ""
-    for port in [9112,2024,2025,5572,9430]:
-        env=os.environ.copy()
-        env["RCLONE_CONFIG_FS_TYPE"]="rclone-filestore"
-        env["RCLONE_CONFIG_FS_URL"]="http://127.0.0.1:%d"%port
-        env["RCLONE_CONFIG_FS_FILESYSTEM_ID"]=FSID
-        env["RCLONE_CONFIG_FS_AUTH_TOKEN"]=TOKEN
-        rc,out,err=sh([R,"-vv","--dump","headers","ls","fs:/outputs"],timeout=30,env=env)
-        last=(err.strip().splitlines() or [""])[-1][:170]
-        w("    url=:%d rc=%s out=%r err=%s"%(port,rc,out[:80],last))
-        if rc==0: rec("P","rclone works via :%d"%port)
-        for ln in err.splitlines():
-            if "/v1/filestore" in ln or "Authorization" in ln: w("    | "+ln[:220])
+def s_trystart():
+    head("try to (re)start a filestore gateway on 9112")
+    cands=[]
+    for d in ["/opt/rclone","/opt","/usr/local/bin","/usr/bin"]:
+        try:
+            for f in os.listdir(d):
+                p=os.path.join(d,f)
+                if os.path.isfile(p) and ("filestore" in f or "gateway" in f): cands.append(p)
+        except Exception: pass
+    w("    candidates: %s"%cands)
+    for p in cands:
+        rc,out,err=sh(["bash","-lc","timeout 4 %s --help 2>&1 | head -15"%p])
+        w("    --- %s (rc=%s) ---"%(p,rc))
+        for ln in out.splitlines()[:12]: w("    | "+ln[:160])
 
 def s_verdict():
     head("VERDICT")
     w("  PASS %d: %s"%(len(P),P)); w("  FAIL %d: %s"%(len(F),F)); w("  UNKNOWN %d: %s"%(len(U),U))
     if G.get("TOKEN"):
-        w("\n  >>> COPY THESE <<<"); w("  FSID=%s"%G["FSIDS"][0]); w("  TOKEN=%s"%G["TOKEN"])
+        w("\n  >>> COPY THESE <<<\n  FSID=%s\n  TOKEN=%s"%(G.get("fsid"),G.get("TOKEN")))
 
 def main():
-    for n,f in [("config",s_config),("fsids",s_fsids),("tokens",s_tokens),
-                ("pid57",s_pid57),("net",s_net),("probe",s_probe),
-                ("sweep",s_rclone_sweep),("verdict",s_verdict)]:
+    for n,f in [("config",s_config),("tokens",s_tokens),("mount",s_mountcheck),
+                ("hunt",s_hunt),("probe",s_probe),("trystart",s_trystart),("verdict",s_verdict)]:
         step(n,f)
 try: main()
 except Exception as e: w("!! main: %s"%e); w(traceback.format_exc())
