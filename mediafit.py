@@ -113,7 +113,7 @@ def s_udp():
     for port in [53,123,5353,9999]:
         try:
             s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3)
-            s.sendto(q,(8.8.8.8,port)); d,_=s.recvfrom(600); s.close()
+            s.sendto(q,("8.8.8.8",port)); d,_=s.recvfrom(600); s.close()
             w("    UDP 8.8.8.8:%-5d -> %d b"%(port,len(d)))
         except Exception as e: w("    UDP 8.8.8.8:%-5d -> %s"%(port,str(e)[:50]))
 
