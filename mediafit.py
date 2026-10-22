@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""mediafit v5.6.0 -- file UUID/URL hunt, media_type->Content-Type (XSS), full createFile schema,
+"""mediafit v5.6.1 -- FIX: mpreq() returns (body, headers).
+file UUID/URL hunt, media_type->Content-Type (XSS), full createFile schema,
 range valid-offset/over-length, poll() portscan, listDirectory verb matrix."""
 import os, sys, json, re, time, ssl, base64, socket, select, subprocess, traceback
 import urllib.request, urllib.error
 
-VER="5.6.0"; API="https://api.anthropic.com"; FS=API+"/v1/filestore/fs/"
+VER="5.6.1"; API="https://api.anthropic.com"; FS=API+"/v1/filestore/fs/"
 OUTD="/mnt/user-data/outputs"
 
 OUT,G=[],{}
@@ -44,34 +45,30 @@ def http_json(url,method="POST",token=None,body=None,t=15,hdrs=None,cap=400000):
 def api(m,p,tk=None,t=15):
     s,b,_=http_json(FS+m,"POST",tk,p,t,{"Connect-Protocol-Version":"1"}); return s,b
 
-def poll_scan(ip,ports,timeout=1.2):
-    ps=select.poll(); socks={}
-    for p in ports:
-        try:
-            s=socket.socket(); s.setblocking(0); s.connect_ex((ip,p)); ps.register(s,select.POLLOUT)
-            socks[s.fileno()]=s
-        except Exception: pass
-    open_=[]; t0=time.time()
-    while socks and time.time()-t0<timeout:
-        for fd,ev in ps.poll(50):
-            s=socks.pop(fd,None)
-            if not s: continue
-            try:
-                if s.getsockopt(socket.SOL_SOCKET,socket.SO_ERROR)==0: open_.append(s.getsockname()[1] if False else None)
-            except Exception: pass
-            s.close()
-    # map back
-    return sorted(set(open_)) if False else sorted(open_)
+# ---------- FIXED multipart helper: returns (body, headers) ----------
+def mpreq(params, fn, fd):
+    B=("----mf"+base64.urlsafe_b64encode(os.urandom(6)).rstrip(b"=").decode()).encode()
+    out =b"--"+B+b"\r\nContent-Disposition: form-data; name=\"params\"\r\n"
+    out+=b"Content-Type: application/json\r\n\r\n"+json.dumps(params).encode()+b"\r\n"
+    out+=b"--"+B+b"\r\nContent-Disposition: form-data; name=\"file\"; filename=\""+fn.encode()+b"\"\r\n"
+    out+=b"Content-Type: application/octet-stream\r\n\r\n"+fd+b"\r\n"
+    out+=b"--"+B+b"--\r\n"
+    return out, {"Content-Type":"multipart/form-data; boundary="+B.decode(),
+                 "Connect-Protocol-Version":"1"}
+def putfile(path, data, media_type="text/plain"):
+    body,H=mpreq({"filesystem_id":G.get("fsid"),"path":path,"media_type":media_type},
+                 os.path.basename(path), data)
+    return http_json(FS+"createFile","POST",G.get("tk"),body,25,H)
 
-def poll_scan2(ip,ports,timeout=1.2):
+def poll_scan2(ip,ports,timeout=0.25):
     res=[]
     for p in ports:
         try:
             s=socket.socket(); s.setblocking(0)
             if s.connect_ex((ip,p))==0: res.append(p); s.close(); continue
             ps=select.poll(); ps.register(s,select.POLLOUT)
-            if ps.poll(int(timeout*1000)):
-                if s.getsockopt(socket.SOL_SOCKET,socket.SO_ERROR)==0: res.append(p)
+            if ps.poll(int(timeout*1000)) and s.getsockopt(socket.SOL_SOCKET,socket.SO_ERROR)==0:
+                res.append(p)
             s.close()
         except Exception: pass
     return sorted(res)
@@ -114,68 +111,47 @@ def s_boot():
     w("    fsid=%s write=%s uploads=%s"%(fsid,bool(tk),bool(up)))
     rec("P" if tk else "F","tokens write=%s uploads=%s"%(bool(tk),bool(up)))
 
-def MP(params,fn,fd,B):
-    out=b"--"+B+b"\r\nContent-Disposition: form-data; name=\"params\"\r\n"
-    out+=b"Content-Type: application/json\r\n\r\n"+json.dumps(params).encode()+b"\r\n"
-    out+=b"--"+B+b"\r\nContent-Disposition: form-data; name=\"file\"; filename=\""+fn.encode()+b"\"\r\n"
-    out+=b"Content-Type: application/octet-stream\r\n\r\n"+fd+b"\r\n"
-    return out+b"--"+B+b"--\r\n"
-def newB(): return ("----mf"+base64.urlsafe_b64encode(os.urandom(6)).rstrip(b"=").decode()).encode()
-
 # ------------------------------------------------------------------ 2
 def s_schema():
     head("2. FULL createFile SCHEMA (find the 'd' field / any URL)")
-    tk=G.get("tk"); fsid=G.get("fsid")
-    if not tk: return
-    B=newB()
-    H={"Content-Type":"multipart/form-data; boundary="+B.decode(),"Connect-Protocol-Version":"1"}
-    st,b,_=http_json(FS+"createFile","POST",tk,
-        MP({"filesystem_id":fsid,"path":"/outputs/schema.txt","media_type":"text/plain"},"schema.txt",b"SCHEMA-PROBE"),25,H)
+    if not G.get("tk"): return
+    st,b,_=putfile("/outputs/schema.txt",b"SCHEMA-PROBE","text/plain")
     w("    status=%s"%st)
-    w("    FULL BODY:\n%s"%json.dumps(json.loads(b),indent=2)[:2200] if st==200 else b[:600])
     if st==200:
         j=json.loads(b)
-        def walk(o,path=""):
-            if isinstance(o,dict):
-                for k,v in o.items():
-                    if isinstance(v,(dict,list)): walk(v,path+"."+k)
-                    else: w("        %-40s = %r"%(path+"."+k,str(v)[:90]))
-            elif isinstance(o,list):
-                for i,v in enumerate(o[:3]): walk(v,path+"[%d]"%i)
-        walk(j)
+        w("    FULL BODY:\n%s"%json.dumps(j,indent=2)[:2400])
         flat={}
         def collect(o):
             if isinstance(o,dict):
                 for k,v in o.items():
                     if isinstance(v,(dict,list)): collect(v)
                     else: flat[k]=v
+            elif isinstance(o,list):
+                for v in o: collect(v)
         collect(j)
-        G["uuid"]=flat.get("uuid"); G["fname"]="schema.txt"
-        rec("P","createFile full schema captured uuid=%s"%flat.get("uuid"))
+        G["uuid"]=flat.get("uuid")
+        rec("P","createFile schema captured uuid=%s"%flat.get("uuid"))
         for k,v in flat.items():
-            if "url" in k.lower() or "uri" in k.lower() or "link" in k.lower():
+            if any(x in k.lower() for x in ("url","uri","link","href","download")):
                 rec("P","*** URL FIELD: %s = %s ***"%(k,v))
+    else:
+        w("    body=%s"%b[:500])
 
 # ------------------------------------------------------------------ 3
 def s_url():
-    head("3. FILE URL HUNT (uuid as address) + media_type -> Content-Type")
+    head("3. FILE URL HUNT + media_type -> Content-Type")
     tk=G.get("tk"); fsid=G.get("fsid"); uu=G.get("uuid")
-    if not tk or not uu: rec("U","no uuid"); return
-    B=newB()
-    H={"Content-Type":"multipart/form-data; boundary="+B.decode(),"Connect-Protocol-Version":"1"}
+    if not tk: return
     HTML=b"<html><body><h1>MEDIAFIT</h1><script>alert(1)</script></body></html>"
-    st,b,_=http_json(FS+"createFile","POST",tk,
-        MP({"filesystem_id":fsid,"path":"/outputs/xss.html","media_type":"text/html"},"xss.html",HTML),25,H)
-    w("    createFile xss.html -> %s"%st)
     SVG=b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(2)</script></svg>"
-    st2,_,_=http_json(FS+"createFile","POST",tk,
-        MP({"filesystem_id":fsid,"path":"/outputs/xss.svg","media_type":"image/svg+xml"},"xss.svg",SVG),25,H)
-    w("    createFile xss.svg  -> %s"%st2)
-    cands=[]
-    for pat in ["/v1/filestore/files/%s","/v1/filestore/fs/files/%s","/v1/filestore/download/%s",
-                "/v1/filestore/blob/%s","/v1/files/%s","/v1/files/%s/content",
-                "/v1/filestore/file/%s","/v1/filestore/fs/blob/%s"]:
-        cands.append(pat%uu)
+    st,_,_=putfile("/outputs/xss.html",HTML,"text/html")
+    w("    createFile xss.html -> %s"%st)
+    st,_,_=putfile("/outputs/xss.svg",SVG,"image/svg+xml")
+    w("    createFile xss.svg  -> %s"%st)
+    if not uu: rec("U","no uuid"); return
+    cands=[p%uu for p in ["/v1/filestore/files/%s","/v1/filestore/fs/files/%s",
+        "/v1/filestore/download/%s","/v1/filestore/blob/%s","/v1/files/%s",
+        "/v1/files/%s/content","/v1/filestore/file/%s","/v1/filestore/fs/blob/%s"]]
     for u in cands:
         for tok,lbl in [(tk,"auth"),(None,"noauth")]:
             st,b,h=http_json(API+u,"GET",tok,None,8)
@@ -184,36 +160,30 @@ def s_url():
                 w("    GET %-46s [%s] -> %s ct=%s len=%d %r"%(u,lbl,st,ct,len(b),b[:60]))
                 if st==200:
                     rec("P","*** FILE SERVED at %s (auth=%s) ***"%(u,lbl))
-                    if "html" in ct.lower(): rec("P","*** Content-Type from media_type -> STORED XSS ***")
-    # uuid accepted as path?
-    for body in [{"filesystem_id":fsid,"path":uu},
-                 {"filesystem_id":fsid,"file_uuid":uu},
-                 {"filesystem_id":fsid,"uuid":uu},
-                 {"filesystem_id":fsid,"path":"/outputs/xss.html"}]:
+                    if "html" in ct.lower():
+                        rec("P","*** Content-Type FROM media_type -> STORED XSS ***")
+    for body in [{"filesystem_id":fsid,"path":uu},{"filesystem_id":fsid,"file_uuid":uu},
+                 {"filesystem_id":fsid,"uuid":uu},{"filesystem_id":fsid,"path":"/outputs/xss.html"}]:
         st,b=api("readFile",body,tk)
-        w("    readFile %-46s -> %s %r"%(list(body)[-1],st,b[:60]))
-    # getFile/stat variants
-    for m in ["getFile","statFile","getFileMetadata","getFileByUuid","listFiles","getFilesystem","listFilesystems"]:
+        w("    readFile key=%-12s -> %s %r"%(list(body)[-1],st,b[:60]))
+    for m in ["getFile","statFile","getFileMetadata","getFileByUuid","listFiles",
+              "getFilesystem","listFilesystems"]:
         st,b=api(m,{"filesystem_id":fsid,"uuid":uu,"path":"/outputs/xss.html"},tk)
         if st!=404:
-            w("    %-18s -> %s %s"%(m,st,b[:180].decode("utf-8","replace")))
+            w("    %-18s -> %s %s"%(m,st,b[:200].decode("utf-8","replace")))
             if st==200: rec("P","method live: %s"%m)
 
 # ------------------------------------------------------------------ 4
 def s_range():
-    head("4. range edge cases (valid offset, over-length)")
-    tk=G.get("tk"); fsid=G.get("fsid")
-    if not tk: return
-    B=newB(); H={"Content-Type":"multipart/form-data; boundary="+B.decode(),"Connect-Protocol-Version":"1"}
-    data=b"A"*1000
-    http_json(FS+"createFile","POST",tk,MP({"filesystem_id":fsid,"path":"/outputs/rng.bin",
-                                            "media_type":"application/octet-stream"},"rng.bin",data),20,H)
-    st,b=api("readFile",{"filesystem_id":fsid,"path":"/outputs/rng.bin"},tk)
-    w("    baseline size=%d (local declared 1000) -> %s len=%d"%(1000,st,len(b)))
+    head("4. range edge cases")
+    if not G.get("tk"): return
+    putfile("/outputs/rng.bin",b"A"*1000,"application/octet-stream")
+    st,b=api("readFile",{"filesystem_id":G["fsid"],"path":"/outputs/rng.bin"},G["tk"])
+    w("    baseline -> %s len=%d (declared 1000)"%(st,len(b)))
     for lbl,off,ln in [("exact",0,1000),("over-len",0,5000),("mid-over",500,5000),
                        ("last-byte",999,1),("one-past",1000,1),("huge",0,2**31-1)]:
-        st2,b2=api("readFile",{"filesystem_id":fsid,"path":"/outputs/rng.bin",
-                               "range":{"offset":off,"length":ln}},tk)
+        st2,b2=api("readFile",{"filesystem_id":G["fsid"],"path":"/outputs/rng.bin",
+                               "range":{"offset":off,"length":ln}},G["tk"])
         w("    range %-10s off=%-6d len=%-11d -> %s got=%d"%(lbl,off,ln,st2,len(b2)))
         if st2==200 and lbl=="over-len" and len(b2)>1000:
             rec("P","*** OVER-LENGTH RANGE returned %d bytes for a 1000-byte file ***"%len(b2))
@@ -221,26 +191,22 @@ def s_range():
 # ------------------------------------------------------------------ 5
 def s_bugs():
     head("5. BUG PROOF (listDirectory / removeFile)")
-    tk=G.get("tk"); fsid=G.get("fsid")
-    if not tk: return
+    if not G.get("tk"): return
+    fsid=G["fsid"]; tk=G["tk"]
     api("makeDirectory",{"filesystem_id":fsid,"path":"/outputs/bugproof"},tk)
-    B=newB(); H={"Content-Type":"multipart/form-data; boundary="+B.decode(),"Connect-Protocol-Version":"1"}
-    http_json(FS+"createFile","POST",tk,MP({"filesystem_id":fsid,"path":"/outputs/bugproof/f1.txt",
-                                            "media_type":"text/plain"},"f1.txt",b"one"),20,H)
-    http_json(FS+"createFile","POST",tk,MP({"filesystem_id":fsid,"path":"/outputs/bugproof/f2.txt",
-                                            "media_type":"text/plain"},"f2.txt",b"two"),20,H)
+    putfile("/outputs/bugproof/f1.txt",b"one")
+    putfile("/outputs/bugproof/f2.txt",b"two")
     st_flat,b_flat=api("listDirectory",{"filesystem_id":fsid,"path":"/outputs/bugproof"},tk)
     st_rec,b_rec=api("listDirectory",{"filesystem_id":fsid,"path":"/outputs/bugproof","recursive":True},tk)
-    w("    FLAT  -> %s %r"%(st_flat,b_flat[:200]))
-    w("    REC   -> %s %r"%(st_rec,b_rec[:300]))
+    w("    FLAT -> %s %r"%(st_flat,b_flat[:200]))
+    w("    REC  -> %s %r"%(st_rec,b_rec[:300]))
     if st_flat==200 and b_flat.strip() in (b"{}",b"") and st_rec==200 and b"entries" in b_rec:
-        rec("P","*** BUG CONFIRMED: flat list empty, recursive list populated (2 files exist) ***")
+        rec("P","*** BUG CONFIRMED: flat list empty while 2 files exist ***")
     st,b=api("removeFile",{"filesystem_id":fsid,"path":"/outputs/bugproof"},tk)
-    w("    removeFile(dir) -> %s %s"%(st,b[:160].decode("utf-8","replace")))
+    w("    removeFile(dir) -> %s %s"%(st,b[:170].decode("utf-8","replace")))
     if st==500: rec("P","*** BUG CONFIRMED: removeFile on directory -> 500 ***")
-    # does the dir survive? does the recursive list still work?
     st,b=api("listDirectory",{"filesystem_id":fsid,"path":"/outputs/bugproof","recursive":True},tk)
-    w("    after 500 removeFile, recursive list -> %s %r"%(st,b[:200]))
+    w("    after 500, recursive list -> %s %r"%(st,b[:200]))
     st,b=api("readFile",{"filesystem_id":fsid,"path":"/outputs/bugproof/f1.txt"},tk)
     w("    f1 still readable -> %s"%st)
 
