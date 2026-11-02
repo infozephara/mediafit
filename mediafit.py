@@ -1,92 +1,81 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""egress2.py -- does the egress gateway allow arbitrary destinations?"""
-import os, ssl, socket
+"""egress3.py -- NUL-byte SNI differential against the egress gateway + allowlist map."""
+import os, socket, struct, ssl, re
 
 OUT = "/mnt/user-data/outputs/mediafit-report.txt"
+IP = "160.79.104.10"
 R = []
 def rec(s): R.append(str(s)); print("[e]", s, flush=True)
 
-CTX = ssl.create_default_context()
+def client_hello(name: bytes) -> bytes:
+    ext_data = struct.pack("!H", len(name) + 3) + b"\x00" + struct.pack("!H", len(name)) + name
+    ext = b"\x00\x00" + struct.pack("!H", len(ext_data)) + ext_data
+    body = (b"\x03\x03" + os.urandom(32) + b"\x00"
+            + struct.pack("!H", 10) + b"\x13\x01\x13\x02\xc0\x2f\xc0\x2b\x00\x9c"
+            + b"\x01\x00"
+            + struct.pack("!H", len(ext)) + ext)
+    hs = b"\x01" + len(body).to_bytes(3, "big") + body
+    return b"\x16\x03\x01" + struct.pack("!H", len(hs)) + hs
 
-def tls_http(ip, sni, port=443, tmo=6):
-    """TLS to a raw IP with an arbitrary SNI, then a GET. Proves egress + cert minting."""
-    info = {"tls": "?", "cn": "?", "iss": "?", "http": "?"}
+def raw_probe(name: bytes, tmo=6):
+    """returns (verdict, names_seen_in_certificate)"""
     try:
-        raw = socket.create_connection((ip, port), timeout=tmo)
+        s = socket.create_connection((IP, 443), timeout=tmo)
     except Exception as e:
-        info["tls"] = "CONN_ERR:%s" % e; return info
+        return "CONN_ERR:%s" % e, []
     try:
-        with CTX.wrap_socket(raw, server_hostname=sni) as ss:
-            info["tls"] = "OK"
-            c = ss.getpeercert() or {}
-            sub = dict(x[0] for x in c.get("subject", ()))
-            iss = dict(x[0] for x in c.get("issuer", ()))
-            info["cn"] = sub.get("commonName", "-")
-            info["iss"] = iss.get("commonName", "-")
-            try:
-                ss.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % sni).encode("latin1"))
-                info["http"] = ss.recv(160).decode("latin1", "replace").split("\r\n")[0]
-            except Exception as e:
-                info["http"] = "ERR:%s" % e
+        s.sendall(client_hello(name))
+        buf = b""
+        for _ in range(6):
+            try: d = s.recv(4096)
+            except socket.timeout: break
+            if not d: break
+            buf += d
+            if len(buf) > 6000: break
+        if not buf: return "NO_RESPONSE", []
+        if buf[0] == 0x15: return "ALERT(deny)", []
+        if buf[0] == 0x16 and len(buf) > 5 and buf[5] == 0x02:
+            names = sorted(set(re.findall(rb"[a-z0-9][a-z0-9\-\.]{3,40}\.(?:com|org|ai|net|io|dev)", buf)))
+            return "SERVER_HELLO(accept)", [n.decode() for n in names][:6]
+        return "OTHER:%02x" % buf[0], []
     except Exception as e:
-        info["tls"] = "TLS_ERR:%s" % e
+        return "ERR:%s" % e, []
     finally:
-        try: raw.close()
+        try: s.close()
         except Exception: pass
-    return info
 
-def plain_http(ip, host, port=80, tmo=6):
+rec("=== CONTROL (plain SNI, no NUL) ===")
+for ctl in (b"github.com", b"example.com"):
+    v, n = raw_probe(ctl)
+    rec("CTL %s => %s names=%s" % (ctl.decode(), v, n))
+
+rec("=== NUL DIFFERENTIAL ===")
+cases = [
+    (b"example.com\x00github.com",  "denied\\x00allowed"),
+    (b"github.com\x00example.com",  "allowed\\x00denied"),
+    (b"example.com\x00.anthropic.com", "denied\\x00allowed_suffix"),
+    (b"nonexistent-zz9.example\x00github.com", "bogus\\x00allowed"),
+    (b"example.com\x00", "denied\\x00empty"),
+]
+for name, label in cases:
+    v, n = raw_probe(name)
+    rec("NUL %s => %s names=%s" % (label, v, n))
+
+rec("=== ALLOWLIST MAP (normal TLS) ===")
+ctx = ssl.create_default_context()
+def reach(host):
     try:
-        s = socket.create_connection((ip, port), timeout=tmo)
-        s.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % host).encode("latin1"))
-        d = s.recv(160).decode("latin1", "replace").split("\r\n")[0]
-        s.close(); return d
+        raw = socket.create_connection((IP, 443), timeout=6)
+        with ctx.wrap_socket(raw, server_hostname=host) as ss:
+            ss.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % host).encode())
+            return ss.recv(80).decode("latin1", "replace").split("\r\n")[0]
     except Exception as e:
         return "ERR:%s" % e
-
-rec("=== TLS TO RAW IP WITH ARBITRARY SNI ===")
-for ip, sni in (("160.79.104.10", "api.anthropic.com"),
-                ("1.1.1.1", "cloudflare-dns.com"),
-                ("1.1.1.1", "example.com"),
-                ("1.1.1.1", "github.com"),
-                ("8.8.8.8", "dns.google"),
-                ("93.184.216.34", "example.com")):
-    i = tls_http(ip, sni)
-    rec("PAIR %s / %s => tls=%s cn=%s issuer=%s http=%s" %
-        (ip, sni, i["tls"], i["cn"], i["iss"], i["http"]))
-
-rec("=== PLAIN HTTP HOST-HEADER VARIANTS (parser differential) ===")
-for ip, host, label in (("1.1.1.1", "example.com", "control_foreign"),
-                        ("1.1.1.1", "api.anthropic.com", "spoof_allowed"),
-                        ("1.1.1.1", "attacker.example\x00.api.anthropic.com", "nul_suffix"),
-                        ("1.1.1.1", "api.anthropic.com.", "trailing_dot"),
-                        ("1.1.1.1", "API.ANTHROPIC.COM", "uppercase"),
-                        ("1.1.1.1", "api.anthropic.com:443", "with_port")):
-    rec("HOST %s (%s) => %s" % (label, host.replace("\x00", "<NUL>"), plain_http(ip, host)))
-
-rec("=== SNI CONTAINING NUL (bytes-level) ===")
-def tls_sni_bytes(ip, sni_bytes, tmo=6):
-    """minimal check: python rejects NUL in str, so build SNI manually is out of scope;
-       we approximate by testing whether str-with-NUL reaches the gateway at all"""
-    try:
-        raw = socket.create_connection((ip, 443), timeout=tmo)
-    except Exception as e: return "CONN_ERR:%s" % e
-    try:
-        with CTX.wrap_socket(raw, server_hostname=sni_bytes) as ss:
-            c = ss.getpeercert() or {}
-            sub = dict(x[0] for x in c.get("subject", ()))
-            return "TLS_OK cn=%s" % sub.get("commonName", "-")
-    except Exception as e:
-        return "ERR:%s" % e
-    finally:
-        try: raw.close()
-        except Exception: pass
-rec("NULSTR => %s" % tls_sni_bytes("160.79.104.10", "a.example\x00.api.anthropic.com"))
-
-rec("=== DIRECT ANTHROPIC API SANITY (does filestore route exist at all?) ===")
-i = tls_http("160.79.104.10", "api.anthropic.com")
-rec("API_ROOT => tls=%s http=%s" % (i["tls"], i["http"]))
+for h in ("api.anthropic.com", "anthropic.com", "claude.ai", "www.anthropic.com",
+          "github.com", "pypi.org", "registry.npmjs.org", "google.com",
+          "example.com", "raw.githubusercontent.com"):
+    rec("MAP %s => %s" % (h, reach(h)))
 
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 open(OUT, "w").write("\n".join(R) + "\n")
